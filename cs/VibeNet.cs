@@ -10,7 +10,8 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace VibeNet;
+namespace VibeNet
+{
 
 public enum VibeNetTransport
 {
@@ -714,7 +715,7 @@ public sealed class VibeNetServer : VibeNetNode
             task = stopTask;
         }
 
-        await task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await VibeNetTask.WaitAsync(task, cancellationToken).ConfigureAwait(false);
     }
 
     public override void Dispose()
@@ -791,7 +792,7 @@ public sealed class VibeNetServer : VibeNetNode
             while (!Lifetime.IsCancellationRequested)
             {
                 TcpClient tcp =
-                    await tcpListener.AcceptTcpClientAsync(Lifetime.Token).ConfigureAwait(false);
+                    await VibeNetSocket.AcceptTcpClientAsync(tcpListener, Lifetime.Token).ConfigureAwait(false);
 
                 if (!TryReserveClientSlot())
                 {
@@ -1081,7 +1082,7 @@ public sealed class VibeNetServer : VibeNetNode
             while (!Lifetime.IsCancellationRequested)
             {
                 UdpReceiveResult result =
-                    await udpSocket.ReceiveAsync(Lifetime.Token).ConfigureAwait(false);
+                    await VibeNetSocket.ReceiveAsync(udpSocket, Lifetime.Token).ConfigureAwait(false);
 
                 if (!VibeNetProtocol.TryParseUdpFrame(
                     result.Buffer,
@@ -1354,7 +1355,7 @@ public sealed class VibeNetServer : VibeNetNode
         await udpSendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await udpSocket.SendAsync(datagram.AsMemory(), endpoint, cancellationToken)
+            await VibeNetSocket.SendAsync(udpSocket, datagram, endpoint, cancellationToken)
                 .ConfigureAwait(false);
         }
         finally
@@ -1923,7 +1924,7 @@ public sealed class VibeNetClient : VibeNetNode
                 try
                 {
                     TcpClient candidate = new TcpClient(address.AddressFamily);
-                    await candidate.ConnectAsync(address, TCPPort, token).ConfigureAwait(false);
+                    await VibeNetSocket.ConnectAsync(candidate, address, TCPPort, token).ConfigureAwait(false);
                     tcpClient = candidate;
                     tcpStream = candidate.GetStream();
                     connectedRemoteAddress = address;
@@ -2148,8 +2149,8 @@ public sealed class VibeNetClient : VibeNetNode
             true,
             true);
 
-        await shutdown.WaitAsync(cancellationToken).ConfigureAwait(false);
-        await AwaitBackgroundTasksAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
+        await VibeNetTask.WaitAsync(shutdown, cancellationToken).ConfigureAwait(false);
+        await VibeNetTask.WaitAsync(AwaitBackgroundTasksAsync(), cancellationToken).ConfigureAwait(false);
     }
 
     public override void Dispose()
@@ -2182,7 +2183,7 @@ public sealed class VibeNetClient : VibeNetNode
             return single;
         }
 
-        IPAddress[] addresses = await Dns.GetHostAddressesAsync(RemoteHost, cancellationToken)
+        IPAddress[] addresses = await VibeNetSocket.GetHostAddressesAsync(RemoteHost, cancellationToken)
             .ConfigureAwait(false);
 
         IPAddress[] filtered = FilterAddresses(addresses);
@@ -2217,7 +2218,7 @@ public sealed class VibeNetClient : VibeNetNode
 
         CancellationToken token = udpTimeout.Token;
         byte[] payload = VibeNetProtocol.CreateRegistrationPayload(ConnectionId, sessionToken);
-        Task<UdpReceiveResult> receiveTask = udpSocket.ReceiveAsync(token).AsTask();
+        Task<UdpReceiveResult> receiveTask = VibeNetSocket.ReceiveAsync(udpSocket, token);
 
         await SendUdpFrameAsync(VibeNetPacketType.UdpRegister, payload, token).ConfigureAwait(false);
         long nextSendAt = VibeNetTime.Timestamp + VibeNetTime.ToStopwatchTicks(Configuration.UDPHandshakeInterval);
@@ -2247,7 +2248,7 @@ public sealed class VibeNetClient : VibeNetNode
                         return VibeNetConnectFailure.None;
                     }
 
-                    receiveTask = udpSocket.ReceiveAsync(token).AsTask();
+                    receiveTask = VibeNetSocket.ReceiveAsync(udpSocket, token);
                     continue;
                 }
 
@@ -2417,7 +2418,7 @@ public sealed class VibeNetClient : VibeNetNode
             while (!Lifetime.IsCancellationRequested)
             {
                 UdpReceiveResult result =
-                    await udpSocket.ReceiveAsync(Lifetime.Token).ConfigureAwait(false);
+                    await VibeNetSocket.ReceiveAsync(udpSocket, Lifetime.Token).ConfigureAwait(false);
 
                 if (!VibeNetProtocol.TryParseUdpFrame(
                     result.Buffer,
@@ -2556,7 +2557,7 @@ public sealed class VibeNetClient : VibeNetNode
         await udpSendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await udp.SendAsync(datagram.AsMemory(), cancellationToken).ConfigureAwait(false);
+            await VibeNetSocket.SendConnectedAsync(udp, datagram, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -3506,6 +3507,174 @@ internal static class VibeNetTime
     }
 }
 
+internal static class VibeNetTask
+{
+    public static async Task WaitAsync(Task task, CancellationToken cancellationToken)
+    {
+        if (!cancellationToken.CanBeCanceled)
+        {
+            await task.ConfigureAwait(false);
+            return;
+        }
+
+        Task completedTask = await Task.WhenAny(
+            task,
+            Task.Delay(Timeout.Infinite, cancellationToken)).ConfigureAwait(false);
+
+        if (!ReferenceEquals(completedTask, task))
+            throw new OperationCanceledException(cancellationToken);
+
+        await task.ConfigureAwait(false);
+    }
+
+    public static async Task<T> WaitAsync<T>(Task<T> task, CancellationToken cancellationToken)
+    {
+        if (!cancellationToken.CanBeCanceled)
+            return await task.ConfigureAwait(false);
+
+        Task completedTask = await Task.WhenAny(
+            task,
+            Task.Delay(Timeout.Infinite, cancellationToken)).ConfigureAwait(false);
+
+        if (!ReferenceEquals(completedTask, task))
+            throw new OperationCanceledException(cancellationToken);
+
+        return await task.ConfigureAwait(false);
+    }
+
+    public static void Observe(Task task)
+    {
+        task.ContinueWith(
+            observedTask =>
+            {
+                _ = observedTask.Exception;
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+}
+
+internal static class VibeNetSocket
+{
+    public static async Task<TcpClient> AcceptTcpClientAsync(
+        TcpListener listener,
+        CancellationToken cancellationToken)
+    {
+        Task<TcpClient> acceptTask = listener.AcceptTcpClientAsync();
+
+        try
+        {
+            return await VibeNetTask.WaitAsync(acceptTask, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            VibeNetTask.Observe(acceptTask);
+            throw;
+        }
+    }
+
+    public static async Task ConnectAsync(
+        TcpClient client,
+        IPAddress address,
+        int port,
+        CancellationToken cancellationToken)
+    {
+        Task connectTask = client.ConnectAsync(address, port);
+
+        try
+        {
+            await VibeNetTask.WaitAsync(connectTask, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            VibeNetTask.Observe(connectTask);
+            try
+            {
+                client.Close();
+            }
+            catch
+            {
+            }
+
+            throw;
+        }
+    }
+
+    public static async Task<IPAddress[]> GetHostAddressesAsync(
+        string host,
+        CancellationToken cancellationToken)
+    {
+        Task<IPAddress[]> lookupTask = Dns.GetHostAddressesAsync(host);
+
+        try
+        {
+            return await VibeNetTask.WaitAsync(lookupTask, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            VibeNetTask.Observe(lookupTask);
+            throw;
+        }
+    }
+
+    public static async Task<UdpReceiveResult> ReceiveAsync(
+        UdpClient udp,
+        CancellationToken cancellationToken)
+    {
+        Task<UdpReceiveResult> receiveTask = udp.ReceiveAsync();
+
+        try
+        {
+            return await VibeNetTask.WaitAsync(receiveTask, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            VibeNetTask.Observe(receiveTask);
+            throw;
+        }
+    }
+
+    public static async Task<int> SendAsync(
+        UdpClient udp,
+        byte[] datagram,
+        IPEndPoint endpoint,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Task<int> sendTask = udp.SendAsync(datagram, datagram.Length, endpoint);
+
+        try
+        {
+            return await VibeNetTask.WaitAsync(sendTask, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            VibeNetTask.Observe(sendTask);
+            throw;
+        }
+    }
+
+    public static async Task<int> SendConnectedAsync(
+        UdpClient udp,
+        byte[] datagram,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Task<int> sendTask = udp.SendAsync(datagram, datagram.Length);
+
+        try
+        {
+            return await VibeNetTask.WaitAsync(sendTask, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            VibeNetTask.Observe(sendTask);
+            throw;
+        }
+    }
+}
+
 internal static class VibeNetDefaults
 {
     public static readonly TimeSpan ControlFrameTimeout = TimeSpan.FromSeconds(2);
@@ -3526,4 +3695,5 @@ internal static class VibeNetCancellation
         source.CancelAfter(timeout);
         return source;
     }
+}
 }
