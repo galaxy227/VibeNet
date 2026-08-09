@@ -1013,13 +1013,13 @@ public sealed class VibeNetServer : VibeNetNode
         connectedQueue.EnqueueDroppingOldest(connectionInfo);
     }
 
-    private async Task HandleConnectedFrameAsync(ServerSession session, NetworkFrame frame)
+    private Task HandleConnectedFrameAsync(ServerSession session, NetworkFrame frame)
     {
         switch (frame.Type)
         {
             case VibeNetPacketType.Pong:
                 VibeNetProtocol.RequireEmptyPayload(frame);
-                return;
+                return Task.CompletedTask;
 
             case VibeNetPacketType.Data:
                 if (frame.Payload.Length > Configuration.MaxTCPPayloadBytes)
@@ -1058,7 +1058,7 @@ public sealed class VibeNetServer : VibeNetNode
                         CancellationToken.None);
                 }
 
-                return;
+                return Task.CompletedTask;
 
             case VibeNetPacketType.Disconnect:
                 VibeNetDisconnectCode code = VibeNetProtocol.ParseDisconnectPayload(frame.Payload);
