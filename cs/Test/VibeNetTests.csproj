@@ -9,6 +9,6 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="../../VibeNet.cs" Link="VibeNet.cs" />
+    <Compile Include="../VibeNet.cs" Link="VibeNet.cs" />
   </ItemGroup>
 </Project>

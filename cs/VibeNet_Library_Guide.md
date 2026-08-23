@@ -9,7 +9,7 @@ This document is the standalone guide for the `VibeNet` library.
 - framed binary protocol headers
 - connection lifecycle and graceful disconnect
 - TCP heartbeat and timeout detection
-- bounded message, error, and event queues
+- bounded message, failure, and event queues
 
 The intended mental model is:
 
@@ -28,7 +28,7 @@ The example below shows one server and one client in the same process. It demons
 - waiting for the authoritative server-side connected event
 - sending both TCP and UDP payloads
 - receiving messages on both ends
-- polling disconnect and error queues
+- polling disconnect and failure queues
 - targeted server send and server broadcast
 - graceful shutdown
 
@@ -53,7 +53,7 @@ internal static class Program
             maxTcpPayloadBytes: 1024 * 1024,
             maxUdpPayloadBytes: 1200,
             maxQueuedMessages: 256,
-            maxQueuedErrors: 64,
+            maxQueuedFailures: 64,
             maxQueuedEvents: 64,
             addressMode: VibeNetAddressMode.IPv4);
 
@@ -76,7 +76,7 @@ internal static class Program
             VibeNetConnectResult serverStart = await server.StartAsync();
             if (!serverStart.Success)
             {
-                Console.WriteLine("Server failed: " + serverStart.Failure + " - " + serverStart.Error);
+                Console.WriteLine("Server failed: " + serverStart.Failure?.Code + " - " + serverStart.Failure?.Message);
                 return;
             }
 
@@ -85,7 +85,7 @@ internal static class Program
             VibeNetConnectResult clientStart = await client.StartAsync();
             if (!clientStart.Success)
             {
-                Console.WriteLine("Client failed: " + clientStart.Failure + " - " + clientStart.Error);
+                Console.WriteLine("Client failed: " + clientStart.Failure?.Code + " - " + clientStart.Failure?.Message);
                 return;
             }
 
@@ -103,8 +103,11 @@ internal static class Program
             byte[] clientTcp = Encoding.UTF8.GetBytes("client over tcp");
             byte[] clientUdp = Encoding.UTF8.GetBytes("client over udp");
 
-            await client.SendAsync(clientTcp, VibeNetTransport.TCP);
-            await client.SendAsync(clientUdp, VibeNetTransport.UDP);
+            if (!await client.SendAsync(clientTcp, VibeNetTransport.TCP))
+                Console.WriteLine("Client TCP send failed.");
+
+            if (!await client.SendAsync(clientUdp, VibeNetTransport.UDP))
+                Console.WriteLine("Client UDP send failed.");
 
             DrainServer(server);
 
@@ -127,8 +130,8 @@ internal static class Program
             DrainClient(client);
 
             // At any point, poll for background failures.
-            DrainErrors("server", server);
-            DrainErrors("client", client);
+            DrainFailures("server", server);
+            DrainFailures("client", client);
 
             // Graceful client disconnect.
             await client.DisconnectAsync();
@@ -207,16 +210,18 @@ internal static class Program
         }
     }
 
-    private static void DrainErrors(string label, VibeNetNode node)
+    private static void DrainFailures(string label, VibeNetNode node)
     {
-        while (node.TryDequeueError(out VibeNetErrorInfo error))
+        while (node.TryDequeueFailure(out VibeNetFailure failure))
         {
             Console.WriteLine(
                 label +
-                " error: " +
-                error.Code +
+                " failure: " +
+                failure.Code +
+                " during " +
+                failure.Operation +
                 " - " +
-                error.Message);
+                failure.Message);
         }
     }
 
@@ -255,7 +260,7 @@ In a real application, the usual structure is:
    - `TryDequeueMessage(...)`
    - `TryDequeueConnected(...)` on server
    - `TryDequeueDisconnected(...)`
-   - `TryDequeueError(...)`
+   - `TryDequeueFailure(...)`
 5. Serialize and deserialize your own application protocol into raw `byte[]`.
 6. On shutdown, call `DisconnectAsync()` for the client or `StopAsync()` for the server.
 7. If you need to reconnect or restart, create a brand new instance. Instances are single-use.
@@ -269,8 +274,8 @@ This section covers every public type and member that application code is expect
 ### `VibeNetTransport`
 
 ```csharp
-await client.SendAsync(data, VibeNetTransport.TCP);
-await client.SendAsync(data, VibeNetTransport.UDP);
+bool tcpSent = await client.SendAsync(data, VibeNetTransport.TCP);
+bool udpSent = await client.SendAsync(data, VibeNetTransport.UDP);
 ```
 
 Selects the application transport for one outbound payload. `TCP` is reliable and ordered. `UDP` is best-effort and connectionless after registration.
@@ -302,17 +307,28 @@ Represents the public lifecycle state of a node or connection snapshot:
 - `Disconnected`
 - `Faulted`
 
-### `VibeNetConnectFailure`
+### `VibeNetFailureCode`
 
 ```csharp
 VibeNetConnectResult result = await client.StartAsync();
-if (!result.Success && result.Failure == VibeNetConnectFailure.ServerRejected)
+if (!result.Success && result.Failure.HasValue)
 {
-    Console.WriteLine(result.Error);
+    Console.WriteLine(result.Failure.Value.Code);
 }
 ```
 
-Explains why `StartAsync()` failed. Important cases include DNS failure, connection refusal, timeout, protocol mismatch, handshake failure, and server rejection.
+Classifies operational networking failures. Important cases include:
+
+- `DnsResolutionFailed`
+- `ConnectionRefused`
+- `ServerRejected`
+- `ProtocolMismatch`
+- `HandshakeFailed`
+- `Timeout`
+- `SendFailure`
+- `ReceiveFailure`
+- `QueueOverflow`
+- `InternalError`
 
 ### `VibeNetDisconnectReason`
 
@@ -333,23 +349,31 @@ Explains why an established connection ended:
 - `ResourceLimit`
 - `ServerStopped`
 
-### `VibeNetErrorCode`
+### `VibeNetOperation`
 
 ```csharp
-while (server.TryDequeueError(out VibeNetErrorInfo error))
+while (server.TryDequeueFailure(out VibeNetFailure failure))
 {
-    Console.WriteLine(error.Code);
+    Console.WriteLine(failure.Operation);
 }
 ```
 
-Classifies asynchronous operational errors:
+Explains where a failure happened. Common values include:
 
-- `SocketError`
-- `ProtocolError`
-- `SendFailure`
-- `ReceiveFailure`
-- `QueueOverflow`
-- `InternalError`
+- `Start`
+- `Resolve`
+- `Accept`
+- `TcpConnect`
+- `HelloHandshake`
+- `UdpHandshake`
+- `ReadyHandshake`
+- `TcpSend`
+- `UdpSend`
+- `TcpReceive`
+- `UdpReceive`
+- `Heartbeat`
+- `Disconnect`
+- `Shutdown`
 
 ## 2.2 Result and data structures
 
@@ -357,14 +381,15 @@ Classifies asynchronous operational errors:
 
 ```csharp
 VibeNetConnectResult result = await client.StartAsync();
-if (!result.Success)
+if (!result.Success && result.Failure.HasValue)
 {
-    Console.WriteLine(result.Failure);
-    Console.WriteLine(result.Error);
+    Console.WriteLine(result.Failure.Value.Code);
+    Console.WriteLine(result.Failure.Value.Operation);
+    Console.WriteLine(result.Failure.Value.Message);
 }
 ```
 
-Returned by `StartAsync()`. `Success` tells whether startup completed. `Failure` and `Error` explain why it did not.
+Returned by `StartAsync()`. `Success` tells whether startup completed. `Failure` contains the unified operational failure object when startup does not succeed.
 
 The static helpers `VibeNetConnectResult.Succeeded()` and `VibeNetConnectResult.Failed(...)` are public, but they are mainly for library construction of results rather than normal application use.
 
@@ -422,21 +447,25 @@ Represents one disconnection event with a final connection snapshot, reason, tex
 
 The constructor is public, but application code normally consumes values emitted by the library.
 
-### `VibeNetErrorInfo`
+### `VibeNetFailure`
 
 ```csharp
-if (client.TryDequeueError(out VibeNetErrorInfo error))
+if (client.TryDequeueFailure(out VibeNetFailure failure))
 {
-    Console.WriteLine(error.ConnectionId);
-    Console.WriteLine(error.Transport);
-    Console.WriteLine(error.Code);
-    Console.WriteLine(error.Message);
+    Console.WriteLine(failure.ConnectionId);
+    Console.WriteLine(failure.Transport);
+    Console.WriteLine(failure.Code);
+    Console.WriteLine(failure.Operation);
+    Console.WriteLine(failure.Message);
 }
 ```
 
-Represents one asynchronous error emitted by the library. This is how background send, receive, protocol, and queue issues are surfaced without callbacks.
+Represents one operational networking failure. The same type is used for:
 
-The constructor is public, but application code normally reads these values from `TryDequeueError(...)`.
+- `StartAsync()` failures through `VibeNetConnectResult`
+- background failures through `TryDequeueFailure(...)`
+
+This keeps failure interpretation consistent even when delivery differs.
 
 ## 2.3 `VibeNetConfiguration`
 
@@ -453,7 +482,7 @@ VibeNetConfiguration config = new VibeNetConfiguration(
     maxTcpPayloadBytes: 1024 * 1024,
     maxUdpPayloadBytes: 1200,
     maxQueuedMessages: 256,
-    maxQueuedErrors: 64,
+    maxQueuedFailures: 64,
     maxQueuedEvents: 64,
     addressMode: VibeNetAddressMode.IPv4);
 ```
@@ -484,7 +513,7 @@ int maxDatagramBytes = config.MaxUDPPayloadBytes;
 - `MaxTCPPayloadBytes`: largest allowed application TCP payload
 - `MaxUDPPayloadBytes`: largest allowed application UDP payload
 - `MaxQueuedMessages`: capacity for received application messages
-- `MaxQueuedErrors`: capacity for error reporting
+- `MaxQueuedFailures`: capacity for failure reporting
 - `MaxQueuedEvents`: capacity for connection/disconnection event queues
 
 ### Address mode
@@ -509,16 +538,16 @@ VibeNetConfiguration config = node.Configuration;
 
 Exposes the node’s configured ports and immutable configuration.
 
-### `TryDequeueError`
+### `TryDequeueFailure`
 
 ```csharp
-while (node.TryDequeueError(out VibeNetErrorInfo error))
+while (node.TryDequeueFailure(out VibeNetFailure failure))
 {
-    Console.WriteLine(error.Message);
+    Console.WriteLine(failure.Message);
 }
 ```
 
-Polls one background error at a time. This is the primary way to observe asynchronous operational problems.
+Polls one background operational failure at a time. This is the primary way to observe asynchronous networking problems that happen when no awaited public method is currently returning.
 
 ### `TryDequeueMessage`
 
@@ -706,14 +735,21 @@ VibeNetConnectResult result = await client.StartAsync();
 
 Attempts full connection establishment. Success means the client is fully connected and both transports are ready for application use.
 
+Caller cancellation throws `OperationCanceledException`. Operational startup failure returns `Success == false` with a populated `Failure`.
+
 ### `SendAsync`
 
 ```csharp
-await client.SendAsync(payload, VibeNetTransport.TCP);
-await client.SendAsync(payload, VibeNetTransport.UDP);
+bool sentTcp = await client.SendAsync(payload, VibeNetTransport.TCP);
+bool sentUdp = await client.SendAsync(payload, VibeNetTransport.UDP);
 ```
 
-Sends raw application bytes to the server over the selected transport. Throws if the client is not currently connected.
+Sends raw application bytes to the server over the selected transport.
+
+- returns `true` when the send completed
+- returns `false` for operational send failure
+- throws for programmer misuse such as sending while disconnected
+- throws `OperationCanceledException` when the caller cancels the awaited send
 
 ### `TryDequeueDisconnected`
 
@@ -759,7 +795,7 @@ await client.StartAsync();
 
 ```csharp
 byte[] payload = MySerializer.Write(message);
-await client.SendAsync(payload, VibeNetTransport.TCP);
+bool sent = await client.SendAsync(payload, VibeNetTransport.TCP);
 ```
 
 The application owns all payload serialization. VibeNet only transports bytes.
@@ -805,7 +841,7 @@ Several design choices are intentional and should be treated as part of the libr
   - `TCPHeartbeatInterval`
   - `TCPHeartbeatTimeout`
 - protocol helpers, frame types, and queue helpers are internal implementation details rather than application API
-- the server queue policy prefers dropping queued UDP pressure before disconnecting an unrelated reliable TCP client
+- the server queue policy prefers dropping queued UDP pressure before disconnecting the sender that exceeded reliable limits
 
 Secondary goals:
 
@@ -1061,7 +1097,7 @@ The public API is intentionally poll-driven.
 The library owns background tasks and threads of control. Application code observes them through queues:
 
 - message queue
-- error queue
+- failure queue
 - server connected-event queue
 - disconnect-event queue
 
@@ -1080,21 +1116,21 @@ The client uses a simple bounded message queue. If the queue is full:
 
 ### Server message queue
 
-The server uses `FairServerMessageQueue`, not a single undifferentiated FIFO.
+The server uses a bounded per-message queue with simple per-sender reliable accounting.
 
 Its policy is:
 
-- keep per-connection ownership
-- round-robin dequeue across owners
+- keep per-connection ownership so queued messages can be removed when a client disconnects
+- preserve simple FIFO dequeue order
 - track reliable TCP occupancy per owner
 - drop incoming UDP first when the shared queue is full
-- disconnect a reliable offender only when reliable pressure exceeds fair limits
+- disconnect only the current reliable sender when reliable pressure exceeds local limits or cannot fit into the remaining shared queue
 
-This server queue is designed to avoid disconnecting an unrelated TCP client merely because another client’s best-effort UDP traffic filled the shared queue.
+This keeps the queue logic small and predictable while still preventing best-effort UDP pressure from knocking out an unrelated client.
 
 ### Error and event queues
 
-Error and event queues drop the oldest item when full. They are observability channels, not connection-fatal paths.
+Failure and event queues drop the oldest item when full. They are observability channels, not connection-fatal paths.
 
 ## 3.18 Payload limits
 
@@ -1160,7 +1196,7 @@ Client lifecycle states and actions:
 - create `VibeNetClient`
 - call `StartAsync()`
 - send TCP or UDP payloads
-- poll messages/errors/disconnects
+- poll messages/failures/disconnects
 - call `DisconnectAsync()` for graceful shutdown
 - call `Dispose()` for immediate local cleanup
 
@@ -1184,22 +1220,24 @@ The public expectation should be:
 
 - cancellation stops waiting for the operation
 - background cleanup still proceeds
-- application code should still poll errors and disconnect queues
+- application code should still poll failures and disconnect queues
 
 ## 3.22 Error model
 
-There are two distinct failure surfaces:
+There are three distinct public outcomes:
 
-1. immediate method results or exceptions
-2. asynchronous `TryDequeueError(...)` reporting
+1. programmer misuse throws normal C# exceptions
+2. caller cancellation throws `OperationCanceledException`
+3. operational networking failure uses `VibeNetFailure`
 
 Examples:
 
-- `StartAsync()` returns `VibeNetConnectResult`
 - invalid usage such as sending while disconnected throws immediately
-- background socket, protocol, send, receive, and queue issues are reported through `VibeNetErrorInfo`
+- `StartAsync()` returns `VibeNetConnectResult`, whose `Failure` is a `VibeNetFailure`
+- background socket, protocol, send, receive, and queue issues are reported through `TryDequeueFailure(...)`
+- `client.SendAsync(...)` and `server.SendAsync(...)` return transport success as `bool`, while the associated operational failure still enters the failure queue
 
-Disconnect events are separate from error events. A connection can end for a clean reason without producing a fatal background error.
+Disconnect events are separate from failures. A connection can end for a clean reason without producing a failure.
 
 ## 3.23 Disconnect semantics and final states
 

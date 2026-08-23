@@ -38,19 +38,22 @@ public enum VibeNetConnectionState
     Faulted
 }
 
-public enum VibeNetConnectFailure
+public enum VibeNetFailureCode
 {
     None,
-    Cancelled,
+    Aborted,
     Timeout,
     DnsResolutionFailed,
     ConnectionRefused,
     ServerRejected,
     ProtocolMismatch,
-    TCPHandshakeFailed,
-    UDPHandshakeFailed,
-    ReadyHandshakeFailed,
-    SocketError
+    HandshakeFailed,
+    ProtocolError,
+    SocketError,
+    SendFailure,
+    ReceiveFailure,
+    QueueOverflow,
+    InternalError
 }
 
 public enum VibeNetDisconnectReason
@@ -64,37 +67,44 @@ public enum VibeNetDisconnectReason
     ServerStopped
 }
 
-public enum VibeNetErrorCode
+public enum VibeNetOperation
 {
-    SocketError,
-    ProtocolError,
-    SendFailure,
-    ReceiveFailure,
-    QueueOverflow,
-    InternalError
+    None,
+    Start,
+    Resolve,
+    Accept,
+    TcpConnect,
+    HelloHandshake,
+    UdpHandshake,
+    ReadyHandshake,
+    TcpSend,
+    UdpSend,
+    TcpReceive,
+    UdpReceive,
+    Heartbeat,
+    Disconnect,
+    Shutdown
 }
 
 public readonly struct VibeNetConnectResult
 {
     public bool Success { get; }
-    public VibeNetConnectFailure Failure { get; }
-    public string? Error { get; }
+    public VibeNetFailure? Failure { get; }
 
-    private VibeNetConnectResult(bool success, VibeNetConnectFailure failure, string? error)
+    private VibeNetConnectResult(bool success, VibeNetFailure? failure)
     {
         Success = success;
         Failure = failure;
-        Error = error;
     }
 
     public static VibeNetConnectResult Succeeded()
     {
-        return new VibeNetConnectResult(true, VibeNetConnectFailure.None, null);
+        return new VibeNetConnectResult(true, null);
     }
 
-    public static VibeNetConnectResult Failed(VibeNetConnectFailure failure, string? error = null)
+    public static VibeNetConnectResult Failed(VibeNetFailure failure)
     {
-        return new VibeNetConnectResult(false, failure, error);
+        return new VibeNetConnectResult(false, failure);
     }
 }
 
@@ -164,19 +174,21 @@ public readonly struct VibeNetDisconnectInfo
     }
 }
 
-public readonly struct VibeNetErrorInfo
+public readonly struct VibeNetFailure
 {
     public Guid? ConnectionId { get; }
     public VibeNetTransport? Transport { get; }
-    public VibeNetErrorCode Code { get; }
+    public VibeNetFailureCode Code { get; }
+    public VibeNetOperation Operation { get; }
     public string Message { get; }
     public Exception? Exception { get; }
     public DateTime OccurredAtUtc { get; }
 
-    public VibeNetErrorInfo(
+    public VibeNetFailure(
         Guid? connectionId,
         VibeNetTransport? transport,
-        VibeNetErrorCode code,
+        VibeNetFailureCode code,
+        VibeNetOperation operation,
         string message,
         Exception? exception,
         DateTime occurredAtUtc)
@@ -184,6 +196,7 @@ public readonly struct VibeNetErrorInfo
         ConnectionId = connectionId;
         Transport = transport;
         Code = code;
+        Operation = operation;
         Message = message ?? string.Empty;
         Exception = exception;
         OccurredAtUtc = occurredAtUtc;
@@ -205,7 +218,7 @@ public sealed class VibeNetConfiguration
     public int MaxTCPPayloadBytes { get; }
     public int MaxUDPPayloadBytes { get; }
     public int MaxQueuedMessages { get; }
-    public int MaxQueuedErrors { get; }
+    public int MaxQueuedFailures { get; }
     public int MaxQueuedEvents { get; }
 
     public VibeNetAddressMode AddressMode { get; }
@@ -220,7 +233,7 @@ public sealed class VibeNetConfiguration
         int maxTcpPayloadBytes = 1024 * 1024,
         int maxUdpPayloadBytes = 1200,
         int maxQueuedMessages = 4096,
-        int maxQueuedErrors = 256,
+        int maxQueuedFailures = 256,
         int maxQueuedEvents = 1024,
         VibeNetAddressMode addressMode = VibeNetAddressMode.IPv4)
     {
@@ -234,7 +247,7 @@ public sealed class VibeNetConfiguration
         MaxTCPPayloadBytes = maxTcpPayloadBytes;
         MaxUDPPayloadBytes = maxUdpPayloadBytes;
         MaxQueuedMessages = maxQueuedMessages;
-        MaxQueuedErrors = maxQueuedErrors;
+        MaxQueuedFailures = maxQueuedFailures;
         MaxQueuedEvents = maxQueuedEvents;
         AddressMode = addressMode;
 
@@ -265,8 +278,8 @@ public sealed class VibeNetConfiguration
         if (MaxQueuedMessages <= 0)
             throw new ArgumentOutOfRangeException(nameof(MaxQueuedMessages));
 
-        if (MaxQueuedErrors <= 0)
-            throw new ArgumentOutOfRangeException(nameof(MaxQueuedErrors));
+        if (MaxQueuedFailures <= 0)
+            throw new ArgumentOutOfRangeException(nameof(MaxQueuedFailures));
 
         if (MaxQueuedEvents <= 0)
             throw new ArgumentOutOfRangeException(nameof(MaxQueuedEvents));
@@ -288,7 +301,7 @@ public abstract class VibeNetNode : IDisposable
     public int UDPPort { get; }
     public VibeNetConfiguration Configuration { get; }
 
-    private readonly DropOldestQueue<VibeNetErrorInfo> errorQueue;
+    private readonly BoundedQueue<VibeNetFailure> failureQueue;
 
     protected readonly CancellationTokenSource Lifetime = new CancellationTokenSource();
 
@@ -302,12 +315,14 @@ public abstract class VibeNetNode : IDisposable
         TCPPort = tcpPort;
         UDPPort = actualUdpPort;
         Configuration = configuration ?? new VibeNetConfiguration();
-        errorQueue = new DropOldestQueue<VibeNetErrorInfo>(Configuration.MaxQueuedErrors);
+        failureQueue = new BoundedQueue<VibeNetFailure>(
+            Configuration.MaxQueuedFailures,
+            BoundedQueueOverflowMode.DropOldest);
     }
 
-    public bool TryDequeueError(out VibeNetErrorInfo error)
+    public bool TryDequeueFailure(out VibeNetFailure failure)
     {
-        return errorQueue.TryDequeue(out error);
+        return failureQueue.TryDequeue(out failure);
     }
 
     public abstract bool TryDequeueMessage(out VibeNetMessage message);
@@ -317,21 +332,58 @@ public abstract class VibeNetNode : IDisposable
 
     public abstract void Dispose();
 
-    protected void ReportError(
-        Guid? connectionId,
-        VibeNetTransport? transport,
-        VibeNetErrorCode code,
+    protected void ReportFailure(
+        VibeNetFailureCode code,
+        VibeNetOperation operation,
         string message,
+        Guid? connectionId = null,
+        VibeNetTransport? transport = null,
         Exception? exception = null)
     {
-        errorQueue.EnqueueDroppingOldest(
-            new VibeNetErrorInfo(
+        failureQueue.TryEnqueue(
+            new VibeNetFailure(
                 connectionId,
                 transport,
                 code,
+                operation,
                 message,
                 exception,
                 DateTime.UtcNow));
+    }
+
+    protected void ReportReceiveException(
+        VibeNetOperation operation,
+        string message,
+        Exception exception,
+        Guid? connectionId,
+        VibeNetTransport transport)
+    {
+        ReportFailure(
+            ClassifyReceiveException(exception),
+            operation,
+            message,
+            connectionId,
+            transport,
+            exception);
+    }
+
+    protected static VibeNetFailureCode ClassifyReceiveException(Exception exception)
+    {
+        if (exception is SocketException)
+            return VibeNetFailureCode.SocketError;
+
+        if (exception is IOException)
+            return VibeNetFailureCode.ReceiveFailure;
+
+        return VibeNetFailureCode.InternalError;
+    }
+
+    protected static bool IsControlSendException(Exception exception)
+    {
+        return exception is OperationCanceledException ||
+               exception is IOException ||
+               exception is SocketException ||
+               exception is ObjectDisposedException;
     }
 
     protected void ValidatePayload(byte[] data, VibeNetTransport transport)
@@ -407,9 +459,9 @@ public sealed class VibeNetServer : VibeNetNode
     private readonly object stateLock = new object();
     private readonly object sessionsLock = new object();
 
-    private readonly DropOldestQueue<VibeNetConnectionInfo> connectedQueue;
-    private readonly DropOldestQueue<VibeNetDisconnectInfo> disconnectedQueue;
-    private readonly FairServerMessageQueue messageQueue;
+    private readonly BoundedQueue<VibeNetConnectionInfo> connectedQueue;
+    private readonly BoundedQueue<VibeNetDisconnectInfo> disconnectedQueue;
+    private readonly ServerMessageQueue messageQueue;
     private readonly SemaphoreSlim udpSendLock = new SemaphoreSlim(1, 1);
 
     private readonly Dictionary<Guid, ServerSession> sessions =
@@ -482,11 +534,15 @@ public sealed class VibeNetServer : VibeNetNode
         MaxClients = maxClients;
         BindAddress = ResolveBindAddress(bindAddress, Configuration.AddressMode);
         connectedQueue =
-            new DropOldestQueue<VibeNetConnectionInfo>(Configuration.MaxQueuedEvents);
+            new BoundedQueue<VibeNetConnectionInfo>(
+                Configuration.MaxQueuedEvents,
+                BoundedQueueOverflowMode.DropOldest);
         disconnectedQueue =
-            new DropOldestQueue<VibeNetDisconnectInfo>(Configuration.MaxQueuedEvents);
+            new BoundedQueue<VibeNetDisconnectInfo>(
+                Configuration.MaxQueuedEvents,
+                BoundedQueueOverflowMode.DropOldest);
         messageQueue =
-            new FairServerMessageQueue(Configuration.MaxQueuedMessages, maxClients);
+            new ServerMessageQueue(Configuration.MaxQueuedMessages, maxClients);
     }
 
     public override bool TryDequeueMessage(out VibeNetMessage message)
@@ -533,8 +589,7 @@ public sealed class VibeNetServer : VibeNetNode
             startAttempted = true;
         }
 
-        if (cancellationToken.IsCancellationRequested)
-            return Task.FromResult(VibeNetConnectResult.Failed(VibeNetConnectFailure.Cancelled));
+        cancellationToken.ThrowIfCancellationRequested();
 
         try
         {
@@ -558,7 +613,15 @@ public sealed class VibeNetServer : VibeNetNode
         {
             CloseServerSockets();
             return Task.FromResult(
-                VibeNetConnectResult.Failed(VibeNetConnectFailure.SocketError, ex.Message));
+                VibeNetConnectResult.Failed(
+                    new VibeNetFailure(
+                        null,
+                        null,
+                        VibeNetFailureCode.SocketError,
+                        VibeNetOperation.Start,
+                        ex.Message,
+                        ex,
+                        DateTime.UtcNow)));
         }
         catch
         {
@@ -597,11 +660,12 @@ public sealed class VibeNetServer : VibeNetNode
             }
             catch (Exception ex)
             {
-                ReportError(
+                ReportFailure(
+                    VibeNetFailureCode.SendFailure,
+                    VibeNetOperation.TcpSend,
+                    "TCP send failed.",
                     session.Id,
                     VibeNetTransport.TCP,
-                    VibeNetErrorCode.SendFailure,
-                    "TCP send failed.",
                     ex);
 
                 await DisconnectSessionAsync(
@@ -638,11 +702,12 @@ public sealed class VibeNetServer : VibeNetNode
         }
         catch (Exception ex)
         {
-            ReportError(
+            ReportFailure(
+                VibeNetFailureCode.SendFailure,
+                VibeNetOperation.UdpSend,
+                "UDP send failed.",
                 session.Id,
                 VibeNetTransport.UDP,
-                VibeNetErrorCode.SendFailure,
-                "UDP send failed.",
                 ex);
 
             return false;
@@ -819,12 +884,22 @@ public sealed class VibeNetServer : VibeNetNode
         catch (SocketException ex)
         {
             if (!Lifetime.IsCancellationRequested)
-                FailServer(ex, VibeNetTransport.TCP, VibeNetErrorCode.SocketError, "TCP accept loop failed.");
+                FailServer(
+                    ex,
+                    VibeNetTransport.TCP,
+                    VibeNetFailureCode.SocketError,
+                    VibeNetOperation.Accept,
+                    "TCP accept loop failed.");
         }
         catch (Exception ex)
         {
             if (!Lifetime.IsCancellationRequested)
-                FailServer(ex, VibeNetTransport.TCP, VibeNetErrorCode.InternalError, "Unexpected TCP accept-loop failure.");
+                FailServer(
+                    ex,
+                    VibeNetTransport.TCP,
+                    VibeNetFailureCode.InternalError,
+                    VibeNetOperation.Accept,
+                    "Unexpected TCP accept-loop failure.");
         }
     }
 
@@ -917,50 +992,31 @@ public sealed class VibeNetServer : VibeNetNode
         }
         catch (VibeNetProtocolException ex)
         {
-            ReportError(
+            ReportFailure(
+                VibeNetFailureCode.ProtocolError,
+                session.State == VibeNetConnectionState.Connecting
+                    ? VibeNetOperation.ReadyHandshake
+                    : VibeNetOperation.TcpReceive,
+                ex.Message,
                 session.Id,
                 VibeNetTransport.TCP,
-                VibeNetErrorCode.ProtocolError,
-                ex.Message,
                 ex);
 
             finalReason = VibeNetDisconnectReason.ProtocolError;
             finalDetail = ex.Message;
         }
-        catch (IOException ex)
-        {
-            if (Volatile.Read(ref session.DisconnectStarted) == 0)
-            {
-                ReportError(
-                    session.Id,
-                    VibeNetTransport.TCP,
-                    VibeNetErrorCode.ReceiveFailure,
-                    "TCP receive failed.",
-                    ex);
-            }
-        }
-        catch (SocketException ex)
-        {
-            if (Volatile.Read(ref session.DisconnectStarted) == 0)
-            {
-                ReportError(
-                    session.Id,
-                    VibeNetTransport.TCP,
-                    VibeNetErrorCode.SocketError,
-                    "TCP receive failed.",
-                    ex);
-            }
-        }
         catch (Exception ex)
         {
             if (Volatile.Read(ref session.DisconnectStarted) == 0)
             {
-                ReportError(
+                ReportReceiveException(
+                    session.State == VibeNetConnectionState.Connecting
+                        ? VibeNetOperation.ReadyHandshake
+                        : VibeNetOperation.TcpReceive,
+                    "TCP receive failed.",
+                    ex,
                     session.Id,
-                    VibeNetTransport.TCP,
-                    VibeNetErrorCode.InternalError,
-                    "Unexpected TCP session failure.",
-                    ex);
+                    VibeNetTransport.TCP);
             }
         }
         finally
@@ -1010,7 +1066,7 @@ public sealed class VibeNetServer : VibeNetNode
             connectionInfo = MakeConnectionInfo(session);
         }
 
-        connectedQueue.EnqueueDroppingOldest(connectionInfo);
+        connectedQueue.TryEnqueue(connectionInfo);
     }
 
     private Task HandleConnectedFrameAsync(ServerSession session, NetworkFrame frame)
@@ -1035,27 +1091,16 @@ public sealed class VibeNetServer : VibeNetNode
 
                 if (enqueueResult.Kind == ServerQueueEnqueueKind.DisconnectCurrent)
                 {
-                    ReportError(
+                    ReportFailure(
+                        VibeNetFailureCode.QueueOverflow,
+                        VibeNetOperation.TcpReceive,
+                        "Reliable message queue limit exceeded.",
                         session.Id,
-                        VibeNetTransport.TCP,
-                        VibeNetErrorCode.QueueOverflow,
-                        "Reliable message queue limit exceeded.");
+                        VibeNetTransport.TCP);
 
                     throw new VibeNetDisconnectSignal(
                         VibeNetDisconnectReason.ResourceLimit,
                         "Reliable message queue limit exceeded.");
-                }
-
-                if (enqueueResult.Kind == ServerQueueEnqueueKind.DisconnectOther &&
-                    TryGetSession(enqueueResult.OffenderId, out ServerSession? offender) &&
-                    offender != null)
-                {
-                    _ = DisconnectSessionAsync(
-                        offender,
-                        VibeNetDisconnectReason.ResourceLimit,
-                        "Reliable message queue limit exceeded.",
-                        false,
-                        CancellationToken.None);
                 }
 
                 return Task.CompletedTask;
@@ -1111,11 +1156,12 @@ public sealed class VibeNetServer : VibeNetNode
 
                 if (frame.Payload.Length > Configuration.MaxUDPPayloadBytes)
                 {
-                    ReportError(
+                    ReportFailure(
+                        VibeNetFailureCode.ProtocolError,
+                        VibeNetOperation.UdpReceive,
+                        "UDP payload exceeds configured maximum.",
                         session.Id,
-                        VibeNetTransport.UDP,
-                        VibeNetErrorCode.ProtocolError,
-                        "UDP payload exceeds configured maximum.");
+                        VibeNetTransport.UDP);
                     continue;
                 }
 
@@ -1129,24 +1175,14 @@ public sealed class VibeNetServer : VibeNetNode
 
                 if (enqueueResult.Kind != ServerQueueEnqueueKind.Enqueued)
                 {
-                    ReportError(
+                    ReportFailure(
+                        VibeNetFailureCode.QueueOverflow,
+                        VibeNetOperation.UdpReceive,
+                        "Incoming UDP datagram dropped because the queue is full.",
                         session.Id,
-                        VibeNetTransport.UDP,
-                        VibeNetErrorCode.QueueOverflow,
-                        "Incoming UDP datagram dropped because the queue is full.");
+                        VibeNetTransport.UDP);
                 }
 
-                if (enqueueResult.Kind == ServerQueueEnqueueKind.DisconnectOther &&
-                    TryGetSession(enqueueResult.OffenderId, out ServerSession? offender) &&
-                    offender != null)
-                {
-                    _ = DisconnectSessionAsync(
-                        offender,
-                        VibeNetDisconnectReason.ResourceLimit,
-                        "Reliable message queue limit exceeded.",
-                        false,
-                        CancellationToken.None);
-                }
             }
         }
         catch (OperationCanceledException)
@@ -1155,15 +1191,15 @@ public sealed class VibeNetServer : VibeNetNode
         catch (ObjectDisposedException)
         {
         }
-        catch (SocketException ex)
-        {
-            if (!Lifetime.IsCancellationRequested)
-                FailServer(ex, VibeNetTransport.UDP, VibeNetErrorCode.SocketError, "UDP receive loop failed.");
-        }
         catch (Exception ex)
         {
             if (!Lifetime.IsCancellationRequested)
-                FailServer(ex, VibeNetTransport.UDP, VibeNetErrorCode.InternalError, "Unexpected UDP receive-loop failure.");
+                FailServer(
+                    ex,
+                    VibeNetTransport.UDP,
+                    ClassifyReceiveException(ex),
+                    VibeNetOperation.UdpReceive,
+                    "UDP receive loop failed.");
         }
     }
 
@@ -1223,11 +1259,12 @@ public sealed class VibeNetServer : VibeNetNode
             ex is SocketException ||
             ex is ObjectDisposedException)
         {
-            ReportError(
+            ReportFailure(
+                VibeNetFailureCode.SendFailure,
+                VibeNetOperation.UdpHandshake,
+                "Failed to acknowledge UDP registration.",
                 session.Id,
                 VibeNetTransport.UDP,
-                VibeNetErrorCode.SendFailure,
-                "Failed to acknowledge UDP registration.",
                 ex);
         }
     }
@@ -1265,7 +1302,12 @@ public sealed class VibeNetServer : VibeNetNode
         catch (Exception ex)
         {
             if (!Lifetime.IsCancellationRequested)
-                FailServer(ex, VibeNetTransport.TCP, VibeNetErrorCode.InternalError, "Heartbeat loop failed.");
+                FailServer(
+                    ex,
+                    VibeNetTransport.TCP,
+                    VibeNetFailureCode.InternalError,
+                    VibeNetOperation.Heartbeat,
+                    "Heartbeat loop failed.");
         }
     }
 
@@ -1287,11 +1329,12 @@ public sealed class VibeNetServer : VibeNetNode
             ex is SocketException ||
             ex is ObjectDisposedException)
         {
-            ReportError(
+            ReportFailure(
+                VibeNetFailureCode.SendFailure,
+                VibeNetOperation.Heartbeat,
+                "Heartbeat send failed.",
                 session.Id,
                 VibeNetTransport.TCP,
-                VibeNetErrorCode.SendFailure,
-                "Heartbeat send failed.",
                 ex);
 
             await DisconnectSessionAsync(
@@ -1387,36 +1430,7 @@ public sealed class VibeNetServer : VibeNetNode
 
         if (notifyRemote)
         {
-            using CancellationTokenSource timeout = VibeNetCancellation.CreateLinkedTimeoutSource(
-                VibeNetDefaults.ControlFrameTimeout,
-                cancellationToken);
-
-            try
-            {
-                VibeNetDisconnectCode code =
-                    reason == VibeNetDisconnectReason.ServerStopped
-                    ? VibeNetDisconnectCode.ServerStopping
-                    : VibeNetDisconnectCode.ServerRequested;
-
-                await SendTcpFrameAsync(
-                    session,
-                    VibeNetPacketType.Disconnect,
-                    VibeNetProtocol.CreateDisconnectPayload(code),
-                    timeout.Token).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (
-                ex is OperationCanceledException ||
-                ex is IOException ||
-                ex is SocketException ||
-                ex is ObjectDisposedException)
-            {
-                ReportError(
-                    session.Id,
-                    VibeNetTransport.TCP,
-                    VibeNetErrorCode.SendFailure,
-                    "Failed to send disconnect control frame.",
-                    ex);
-            }
+            await TrySendDisconnectControlFrameAsync(session, reason, cancellationToken).ConfigureAwait(false);
         }
 
         session.HandshakeLifetime.Cancel();
@@ -1448,14 +1462,7 @@ public sealed class VibeNetServer : VibeNetNode
         session.SendLock.Dispose();
 
         if (publishDisconnect)
-        {
-            disconnectedQueue.EnqueueDroppingOldest(
-                new VibeNetDisconnectInfo(
-                    finalInfo,
-                    reason,
-                    detail,
-                    DateTime.UtcNow));
-        }
+            PublishDisconnectEvent(finalInfo, reason, detail);
     }
 
     private void DisconnectSessionImmediate(
@@ -1500,19 +1507,64 @@ public sealed class VibeNetServer : VibeNetNode
         session.SendLock.Dispose();
 
         if (publishDisconnect)
+            PublishDisconnectEvent(finalInfo, reason, detail);
+    }
+
+    private async Task TrySendDisconnectControlFrameAsync(
+        ServerSession session,
+        VibeNetDisconnectReason reason,
+        CancellationToken cancellationToken)
+    {
+        using CancellationTokenSource timeout = VibeNetCancellation.CreateLinkedTimeoutSource(
+            VibeNetDefaults.ControlFrameTimeout,
+            cancellationToken);
+
+        try
         {
-            disconnectedQueue.EnqueueDroppingOldest(
-                new VibeNetDisconnectInfo(
-                    finalInfo,
-                    reason,
-                    detail,
-                    DateTime.UtcNow));
+            VibeNetDisconnectCode code =
+                reason == VibeNetDisconnectReason.ServerStopped
+                ? VibeNetDisconnectCode.ServerStopping
+                : VibeNetDisconnectCode.ServerRequested;
+
+            await SendTcpFrameAsync(
+                session,
+                VibeNetPacketType.Disconnect,
+                VibeNetProtocol.CreateDisconnectPayload(code),
+                timeout.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (IsControlSendException(ex))
+        {
+            ReportFailure(
+                VibeNetFailureCode.SendFailure,
+                VibeNetOperation.Disconnect,
+                "Failed to send disconnect control frame.",
+                session.Id,
+                VibeNetTransport.TCP,
+                ex);
         }
     }
 
-    private void FailServer(Exception exception, VibeNetTransport transport, VibeNetErrorCode code, string message)
+    private void PublishDisconnectEvent(
+        VibeNetConnectionInfo connection,
+        VibeNetDisconnectReason reason,
+        string detail)
     {
-        ReportError(null, transport, code, message, exception);
+        disconnectedQueue.TryEnqueue(
+            new VibeNetDisconnectInfo(
+                connection,
+                reason,
+                detail,
+                DateTime.UtcNow));
+    }
+
+    private void FailServer(
+        Exception exception,
+        VibeNetTransport transport,
+        VibeNetFailureCode code,
+        VibeNetOperation operation,
+        string message)
+    {
+        ReportFailure(code, operation, message, null, transport, exception);
 
         lock (stateLock)
             running = false;
@@ -1574,12 +1626,6 @@ public sealed class VibeNetServer : VibeNetNode
         }
 
         return null;
-    }
-
-    private bool TryGetSession(Guid id, out ServerSession? session)
-    {
-        lock (sessionsLock)
-            return sessions.TryGetValue(id, out session);
     }
 
     private ServerSession? FindSessionByUdpEndPoint(IPEndPoint remoteEndPoint)
@@ -1756,19 +1802,9 @@ public sealed class VibeNetServer : VibeNetNode
 
 public sealed class VibeNetClient : VibeNetNode
 {
-    private enum ConnectStage
-    {
-        Resolve,
-        TcpConnect,
-        Hello,
-        UdpHandshake,
-        ReadySend,
-        ReadyAck
-    }
-
     private readonly object stateLock = new object();
     private readonly BoundedQueue<VibeNetMessage> messageQueue;
-    private readonly DropOldestQueue<VibeNetDisconnectInfo> disconnectedQueue;
+    private readonly BoundedQueue<VibeNetDisconnectInfo> disconnectedQueue;
     private readonly SemaphoreSlim tcpSendLock = new SemaphoreSlim(1, 1);
     private readonly SemaphoreSlim udpSendLock = new SemaphoreSlim(1, 1);
 
@@ -1843,22 +1879,7 @@ public sealed class VibeNetClient : VibeNetNode
     {
         get
         {
-            lock (stateLock)
-            {
-                DateTime lastActivity = lastActivityUtcTicks == 0
-                    ? DateTime.MinValue
-                    : new DateTime(lastActivityUtcTicks, DateTimeKind.Utc);
-
-                return new VibeNetConnectionInfo(
-                    connectionId,
-                    remoteAddress,
-                    tcpRemotePort,
-                    udpRemotePort,
-                    state,
-                    tcpConnectedAtUtc,
-                    connectedAtUtc,
-                    lastActivity);
-            }
+            return MakeConnectionInfo();
         }
     }
 
@@ -1875,7 +1896,9 @@ public sealed class VibeNetClient : VibeNetNode
         RemoteHost = remoteHost;
         messageQueue = new BoundedQueue<VibeNetMessage>(Configuration.MaxQueuedMessages);
         disconnectedQueue =
-            new DropOldestQueue<VibeNetDisconnectInfo>(Configuration.MaxQueuedEvents);
+            new BoundedQueue<VibeNetDisconnectInfo>(
+                Configuration.MaxQueuedEvents,
+                BoundedQueueOverflowMode.DropOldest);
     }
 
     public override bool TryDequeueMessage(out VibeNetMessage message)
@@ -1903,7 +1926,7 @@ public sealed class VibeNetClient : VibeNetNode
             state = VibeNetConnectionState.Connecting;
         }
 
-        ConnectStage stage = ConnectStage.Resolve;
+        VibeNetOperation operation = VibeNetOperation.Resolve;
 
         using CancellationTokenSource timeout =
             VibeNetCancellation.CreateTimeoutSource(Configuration.ClientConnectTimeout);
@@ -1917,9 +1940,11 @@ public sealed class VibeNetClient : VibeNetNode
 
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
             IPAddress[] addresses = await ResolveRemoteAddressesAsync(token).ConfigureAwait(false);
 
-            stage = ConnectStage.TcpConnect;
+            operation = VibeNetOperation.TcpConnect;
             SocketException? lastConnectError = null;
             foreach (IPAddress address in addresses)
             {
@@ -1943,13 +1968,17 @@ public sealed class VibeNetClient : VibeNetNode
 
             if (tcpClient == null || tcpStream == null || connectedRemoteAddress == null)
             {
-                VibeNetConnectFailure failure =
+                VibeNetFailureCode failure =
                     lastConnectError != null &&
                     lastConnectError.SocketErrorCode == SocketError.ConnectionRefused
-                    ? VibeNetConnectFailure.ConnectionRefused
-                    : VibeNetConnectFailure.SocketError;
+                    ? VibeNetFailureCode.ConnectionRefused
+                    : VibeNetFailureCode.SocketError;
 
-                return FailStart(failure, lastConnectError?.Message ?? "Unable to connect.");
+                return FailStart(
+                    failure,
+                    VibeNetOperation.TcpConnect,
+                    lastConnectError?.Message ?? "Unable to connect.",
+                    lastConnectError);
             }
 
             tcpConnectedAtUtc = DateTime.UtcNow;
@@ -1959,22 +1988,31 @@ public sealed class VibeNetClient : VibeNetNode
             lock (stateLock)
                 remoteAddress = NormalizeDisplayAddress(connectedRemoteAddress);
 
-            stage = ConnectStage.Hello;
+            operation = VibeNetOperation.HelloHandshake;
             NetworkFrame? hello = await VibeNetProtocol.ReadTcpFrameAsync(
                 tcpStream,
                 VibeNetProtocol.MaxControlPayloadBytes,
                 token).ConfigureAwait(false);
 
             if (hello == null)
-                return FailStart(VibeNetConnectFailure.TCPHandshakeFailed, "Server closed during handshake.");
+                return FailStart(
+                    VibeNetFailureCode.HandshakeFailed,
+                    VibeNetOperation.HelloHandshake,
+                    "Server closed during handshake.");
 
             if (hello.Type == VibeNetPacketType.Reject)
-                return FailStart(VibeNetConnectFailure.ServerRejected, VibeNetProtocol.ParseRejectPayload(hello.Payload));
+                return FailStart(
+                    VibeNetFailureCode.ServerRejected,
+                    VibeNetOperation.HelloHandshake,
+                    VibeNetProtocol.ParseRejectPayload(hello.Payload));
 
             if (hello.Type != VibeNetPacketType.Hello ||
                 !VibeNetProtocol.TryParseHelloPayload(hello.Payload, out Guid assignedId, out byte[]? tokenBytes))
             {
-                return FailStart(VibeNetConnectFailure.TCPHandshakeFailed, "Invalid HELLO packet.");
+                return FailStart(
+                    VibeNetFailureCode.HandshakeFailed,
+                    VibeNetOperation.HelloHandshake,
+                    "Invalid HELLO packet.");
             }
 
             lock (stateLock)
@@ -1986,26 +2024,22 @@ public sealed class VibeNetClient : VibeNetNode
             udpSocket.Connect(connectedRemoteAddress, UDPPort);
             udpRemotePort = UDPPort;
 
-            stage = ConnectStage.UdpHandshake;
-            VibeNetConnectFailure udpFailure =
-                await PerformUdpHandshakeAsync(token).ConfigureAwait(false);
-
-            if (udpFailure != VibeNetConnectFailure.None)
+            operation = VibeNetOperation.UdpHandshake;
+            bool udpReady = await PerformUdpHandshakeAsync(token).ConfigureAwait(false);
+            if (!udpReady)
             {
                 return FailStart(
-                    udpFailure,
-                    udpFailure == VibeNetConnectFailure.UDPHandshakeFailed
-                        ? "UDP registration acknowledgement was not received."
-                        : "Connection attempt failed.");
+                    VibeNetFailureCode.Timeout,
+                    VibeNetOperation.UdpHandshake,
+                    "UDP registration acknowledgement was not received.");
             }
 
-            stage = ConnectStage.ReadySend;
+            operation = VibeNetOperation.ReadyHandshake;
             await SendTcpFrameAsync(
                 VibeNetPacketType.Ready,
                 VibeNetProtocol.EmptyPayload,
                 token).ConfigureAwait(false);
 
-            stage = ConnectStage.ReadyAck;
             NetworkFrame? readyAck = await VibeNetProtocol.ReadTcpFrameAsync(
                 tcpStream,
                 VibeNetProtocol.MaxControlPayloadBytes,
@@ -2014,7 +2048,8 @@ public sealed class VibeNetClient : VibeNetNode
             if (readyAck == null || readyAck.Type != VibeNetPacketType.ReadyAck)
             {
                 return FailStart(
-                    VibeNetConnectFailure.ReadyHandshakeFailed,
+                    VibeNetFailureCode.HandshakeFailed,
+                    VibeNetOperation.ReadyHandshake,
                     "READY acknowledgement was not received.");
             }
 
@@ -2023,7 +2058,12 @@ public sealed class VibeNetClient : VibeNetNode
             lock (stateLock)
             {
                 if (disposed || shutdownStarted)
-                    return FailStart(VibeNetConnectFailure.Cancelled, "Connection was closed during startup.");
+                {
+                    return FailStart(
+                        VibeNetFailureCode.Aborted,
+                        VibeNetOperation.Start,
+                        "Connection was closed during startup.");
+                }
 
                 connectedAtUtc = DateTime.UtcNow;
                 state = VibeNetConnectionState.Connected;
@@ -2040,43 +2080,58 @@ public sealed class VibeNetClient : VibeNetNode
         }
         catch (OperationCanceledException)
         {
-            if (cancellationToken.IsCancellationRequested || Lifetime.IsCancellationRequested)
-                return FailStart(VibeNetConnectFailure.Cancelled, "Connection attempt was cancelled.");
+            if (cancellationToken.IsCancellationRequested)
+            {
+                AbortStart();
+                throw;
+            }
 
-            if (stage == ConnectStage.UdpHandshake)
-                return FailStart(VibeNetConnectFailure.UDPHandshakeFailed, "UDP registration acknowledgement was not received.");
+            if (Lifetime.IsCancellationRequested)
+            {
+                return FailStart(
+                    VibeNetFailureCode.Aborted,
+                    VibeNetOperation.Start,
+                    "Connection was closed during startup.");
+            }
 
-            return FailStart(VibeNetConnectFailure.Timeout, "Connection attempt timed out.");
+                return FailStart(
+                    VibeNetFailureCode.Timeout,
+                    operation,
+                    GetConnectTimeoutMessage(operation));
         }
         catch (VibeNetProtocolException ex)
         {
-            return stage switch
-            {
-                ConnectStage.ReadySend or ConnectStage.ReadyAck =>
-                    FailStart(VibeNetConnectFailure.ReadyHandshakeFailed, ex.Message),
-                _ => FailStart(
-                    ex.ProtocolMismatch
-                        ? VibeNetConnectFailure.ProtocolMismatch
-                        : VibeNetConnectFailure.TCPHandshakeFailed,
-                    ex.Message)
-            };
+            VibeNetFailureCode code =
+                operation == VibeNetOperation.Resolve
+                ? VibeNetFailureCode.DnsResolutionFailed
+                : ex.ProtocolMismatch
+                    ? VibeNetFailureCode.ProtocolMismatch
+                    : VibeNetFailureCode.HandshakeFailed;
+
+            return FailStart(code, operation, ex.Message, ex);
         }
         catch (SocketException ex)
         {
-            VibeNetConnectFailure failure =
-                ex.SocketErrorCode == SocketError.ConnectionRefused
-                ? VibeNetConnectFailure.ConnectionRefused
-                : VibeNetConnectFailure.SocketError;
+            VibeNetFailureCode failure =
+                operation == VibeNetOperation.Resolve
+                ? VibeNetFailureCode.DnsResolutionFailed
+                : ex.SocketErrorCode == SocketError.ConnectionRefused
+                    ? VibeNetFailureCode.ConnectionRefused
+                    : VibeNetFailureCode.SocketError;
 
-            return FailStart(failure, ex.Message);
+            return FailStart(failure, operation, ex.Message, ex);
         }
         catch (Exception ex)
         {
-            return FailStart(VibeNetConnectFailure.SocketError, ex.Message);
+            return FailStart(
+                VibeNetFailureCode.InternalError,
+                operation,
+                ex.Message,
+                ex);
         }
     }
 
-    public async Task SendAsync(
+    public async Task<bool> SendAsync(
         byte[] data,
         VibeNetTransport transport,
         CancellationToken cancellationToken = default)
@@ -2094,7 +2149,7 @@ public sealed class VibeNetClient : VibeNetNode
                     VibeNetPacketType.Data,
                     data,
                     cancellationToken).ConfigureAwait(false);
-                return;
+                return true;
             }
             catch (OperationCanceledException)
             {
@@ -2102,11 +2157,12 @@ public sealed class VibeNetClient : VibeNetNode
             }
             catch (Exception ex)
             {
-                ReportError(
+                ReportFailure(
+                    VibeNetFailureCode.SendFailure,
+                    VibeNetOperation.TcpSend,
+                    "TCP send failed.",
                     ConnectionId,
                     VibeNetTransport.TCP,
-                    VibeNetErrorCode.SendFailure,
-                    "TCP send failed.",
                     ex);
 
                 await BeginShutdownAsync(
@@ -2115,7 +2171,7 @@ public sealed class VibeNetClient : VibeNetNode
                     true,
                     false).ConfigureAwait(false);
 
-                throw;
+                return false;
             }
         }
 
@@ -2125,6 +2181,7 @@ public sealed class VibeNetClient : VibeNetNode
                 VibeNetPacketType.Data,
                 data,
                 cancellationToken).ConfigureAwait(false);
+            return true;
         }
         catch (OperationCanceledException)
         {
@@ -2132,14 +2189,15 @@ public sealed class VibeNetClient : VibeNetNode
         }
         catch (Exception ex)
         {
-            ReportError(
+            ReportFailure(
+                VibeNetFailureCode.SendFailure,
+                VibeNetOperation.UdpSend,
+                "UDP send failed.",
                 ConnectionId,
                 VibeNetTransport.UDP,
-                VibeNetErrorCode.SendFailure,
-                "UDP send failed.",
                 ex);
 
-            throw;
+            return false;
         }
     }
 
@@ -2210,10 +2268,10 @@ public sealed class VibeNetClient : VibeNetNode
         }).ToArray();
     }
 
-    private async Task<VibeNetConnectFailure> PerformUdpHandshakeAsync(CancellationToken overallToken)
+    private async Task<bool> PerformUdpHandshakeAsync(CancellationToken overallToken)
     {
         if (udpSocket == null || sessionToken == null)
-            return VibeNetConnectFailure.UDPHandshakeFailed;
+            return false;
 
         using CancellationTokenSource udpTimeout =
             VibeNetCancellation.CreateLinkedTimeoutSource(Configuration.UDPHandshakeTimeout, overallToken);
@@ -2247,7 +2305,7 @@ public sealed class VibeNetClient : VibeNetNode
                         frame.Type == VibeNetPacketType.UdpAck &&
                         VibeNetProtocol.RegistrationAckMatches(frame.Payload, ConnectionId))
                     {
-                        return VibeNetConnectFailure.None;
+                        return true;
                     }
 
                     receiveTask = VibeNetSocket.ReceiveAsync(udpSocket, token);
@@ -2264,7 +2322,7 @@ public sealed class VibeNetClient : VibeNetNode
             if (overallToken.IsCancellationRequested)
                 throw;
 
-            return VibeNetConnectFailure.UDPHandshakeFailed;
+            return false;
         }
     }
 
@@ -2304,50 +2362,27 @@ public sealed class VibeNetClient : VibeNetNode
         }
         catch (VibeNetProtocolException ex)
         {
-            ReportError(
+            ReportFailure(
+                VibeNetFailureCode.ProtocolError,
+                VibeNetOperation.TcpReceive,
+                ex.Message,
                 ConnectionId,
                 VibeNetTransport.TCP,
-                VibeNetErrorCode.ProtocolError,
-                ex.Message,
                 ex);
 
             finalReason = VibeNetDisconnectReason.ProtocolError;
             finalDetail = ex.Message;
         }
-        catch (IOException ex)
-        {
-            if (!shutdownStarted)
-            {
-                ReportError(
-                    ConnectionId,
-                    VibeNetTransport.TCP,
-                    VibeNetErrorCode.ReceiveFailure,
-                    "TCP receive failed.",
-                    ex);
-            }
-        }
-        catch (SocketException ex)
-        {
-            if (!shutdownStarted)
-            {
-                ReportError(
-                    ConnectionId,
-                    VibeNetTransport.TCP,
-                    VibeNetErrorCode.SocketError,
-                    "TCP receive failed.",
-                    ex);
-            }
-        }
         catch (Exception ex)
         {
             if (!shutdownStarted)
             {
-                ReportError(
+                ReportReceiveException(
+                    VibeNetOperation.TcpReceive,
+                    "TCP receive failed.",
+                    ex,
                     ConnectionId,
-                    VibeNetTransport.TCP,
-                    VibeNetErrorCode.InternalError,
-                    "Unexpected TCP receive failure.",
-                    ex);
+                    VibeNetTransport.TCP);
             }
         }
         finally
@@ -2379,11 +2414,12 @@ public sealed class VibeNetClient : VibeNetNode
                 if (!messageQueue.TryEnqueue(
                     new VibeNetMessage(null, VibeNetTransport.TCP, frame.Payload)))
                 {
-                    ReportError(
+                    ReportFailure(
+                        VibeNetFailureCode.QueueOverflow,
+                        VibeNetOperation.TcpReceive,
+                        "Reliable message queue limit exceeded.",
                         ConnectionId,
-                        VibeNetTransport.TCP,
-                        VibeNetErrorCode.QueueOverflow,
-                        "Reliable message queue limit exceeded.");
+                        VibeNetTransport.TCP);
 
                     throw new VibeNetDisconnectSignal(
                         VibeNetDisconnectReason.ResourceLimit,
@@ -2435,11 +2471,12 @@ public sealed class VibeNetClient : VibeNetNode
 
                 if (frame.Payload.Length > Configuration.MaxUDPPayloadBytes)
                 {
-                    ReportError(
+                    ReportFailure(
+                        VibeNetFailureCode.ProtocolError,
+                        VibeNetOperation.UdpReceive,
+                        "UDP payload exceeds configured maximum.",
                         ConnectionId,
-                        VibeNetTransport.UDP,
-                        VibeNetErrorCode.ProtocolError,
-                        "UDP payload exceeds configured maximum.");
+                        VibeNetTransport.UDP);
                     continue;
                 }
 
@@ -2448,11 +2485,12 @@ public sealed class VibeNetClient : VibeNetNode
                 if (!messageQueue.TryEnqueue(
                     new VibeNetMessage(null, VibeNetTransport.UDP, frame.Payload)))
                 {
-                    ReportError(
+                    ReportFailure(
+                        VibeNetFailureCode.QueueOverflow,
+                        VibeNetOperation.UdpReceive,
+                        "Incoming UDP datagram dropped because the queue is full.",
                         ConnectionId,
-                        VibeNetTransport.UDP,
-                        VibeNetErrorCode.QueueOverflow,
-                        "Incoming UDP datagram dropped because the queue is full.");
+                        VibeNetTransport.UDP);
                 }
             }
         }
@@ -2466,12 +2504,12 @@ public sealed class VibeNetClient : VibeNetNode
         {
             if (!shutdownStarted)
             {
-                ReportError(
-                    ConnectionId,
-                    VibeNetTransport.UDP,
-                    ex is SocketException ? VibeNetErrorCode.SocketError : VibeNetErrorCode.InternalError,
+                ReportReceiveException(
+                    VibeNetOperation.UdpReceive,
                     "UDP receive loop failed.",
-                    ex);
+                    ex,
+                    ConnectionId,
+                    VibeNetTransport.UDP);
             }
 
             await BeginShutdownAsync(
@@ -2592,25 +2630,10 @@ public sealed class VibeNetClient : VibeNetNode
     {
         bool shouldPublish;
         Guid currentId;
-        IPAddress? currentAddress;
-        int currentTcpPort;
-        int currentUdpPort;
-        DateTime currentTcpConnectedAtUtc;
-        DateTime? currentConnectedAtUtc;
-        DateTime currentLastActivityUtc;
 
         lock (stateLock)
         {
             currentId = connectionId;
-            currentAddress = remoteAddress;
-            currentTcpPort = tcpRemotePort;
-            currentUdpPort = udpRemotePort;
-            currentTcpConnectedAtUtc = tcpConnectedAtUtc;
-            currentConnectedAtUtc = connectedAtUtc;
-            currentLastActivityUtc = lastActivityUtcTicks == 0
-                ? DateTime.MinValue
-                : new DateTime(lastActivityUtcTicks, DateTimeKind.Utc);
-
             if (connectionEstablished)
                 lastDisconnectReason = reason;
 
@@ -2624,60 +2647,25 @@ public sealed class VibeNetClient : VibeNetNode
         }
 
         if (notifyRemote && connectionEstablished)
-        {
-            using CancellationTokenSource timeout = VibeNetCancellation.CreateTimeoutSource(VibeNetDefaults.ControlFrameTimeout);
-
-            try
-            {
-                await SendTcpFrameAsync(
-                    VibeNetPacketType.Disconnect,
-                    VibeNetProtocol.CreateDisconnectPayload(VibeNetDisconnectCode.ClientRequested),
-                    timeout.Token).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (
-                ex is OperationCanceledException ||
-                ex is IOException ||
-                ex is SocketException ||
-                ex is ObjectDisposedException)
-            {
-                ReportError(
-                    currentId,
-                    VibeNetTransport.TCP,
-                    VibeNetErrorCode.SendFailure,
-                    "Failed to send disconnect control frame.",
-                    ex);
-            }
-        }
+            await TrySendDisconnectControlFrameAsync(currentId).ConfigureAwait(false);
 
         Lifetime.Cancel();
         CloseClientSockets();
 
+        VibeNetConnectionState finalState =
+            IsFault(reason)
+            ? VibeNetConnectionState.Faulted
+            : VibeNetConnectionState.Disconnected;
+
+        VibeNetConnectionInfo finalConnection;
         lock (stateLock)
         {
-            state = IsFault(reason)
-                ? VibeNetConnectionState.Faulted
-                : VibeNetConnectionState.Disconnected;
+            state = finalState;
+            finalConnection = MakeConnectionInfoLocked(finalState);
         }
 
         if (shouldPublish)
-        {
-            disconnectedQueue.EnqueueDroppingOldest(
-                new VibeNetDisconnectInfo(
-                    new VibeNetConnectionInfo(
-                        currentId,
-                        currentAddress,
-                        currentTcpPort,
-                        currentUdpPort,
-                        IsFault(reason)
-                            ? VibeNetConnectionState.Faulted
-                            : VibeNetConnectionState.Disconnected,
-                        currentTcpConnectedAtUtc,
-                        currentConnectedAtUtc,
-                        currentLastActivityUtc),
-                    reason,
-                    detail,
-                    DateTime.UtcNow));
-        }
+            PublishDisconnectEvent(finalConnection, reason, detail);
     }
 
     private async Task AwaitBackgroundTasksAsync()
@@ -2691,7 +2679,114 @@ public sealed class VibeNetClient : VibeNetNode
         }
     }
 
-    private VibeNetConnectResult FailStart(VibeNetConnectFailure failure, string detail)
+    private void AbortStart()
+    {
+        CloseClientSockets();
+        Lifetime.Cancel();
+
+        lock (stateLock)
+            state = VibeNetConnectionState.Disconnected;
+    }
+
+    private VibeNetConnectionInfo MakeConnectionInfo()
+    {
+        lock (stateLock)
+            return MakeConnectionInfoLocked(state);
+    }
+
+    private VibeNetConnectionInfo MakeConnectionInfoLocked(VibeNetConnectionState snapshotState)
+    {
+        DateTime lastActivity = lastActivityUtcTicks == 0
+            ? DateTime.MinValue
+            : new DateTime(lastActivityUtcTicks, DateTimeKind.Utc);
+
+        return new VibeNetConnectionInfo(
+            connectionId,
+            remoteAddress,
+            tcpRemotePort,
+            udpRemotePort,
+            snapshotState,
+            tcpConnectedAtUtc,
+            connectedAtUtc,
+            lastActivity);
+    }
+
+    private async Task TrySendDisconnectControlFrameAsync(Guid currentId)
+    {
+        using CancellationTokenSource timeout = VibeNetCancellation.CreateTimeoutSource(
+            VibeNetDefaults.ControlFrameTimeout);
+
+        try
+        {
+            await SendTcpFrameAsync(
+                VibeNetPacketType.Disconnect,
+                VibeNetProtocol.CreateDisconnectPayload(VibeNetDisconnectCode.ClientRequested),
+                timeout.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (IsControlSendException(ex))
+        {
+            ReportFailure(
+                VibeNetFailureCode.SendFailure,
+                VibeNetOperation.Disconnect,
+                "Failed to send disconnect control frame.",
+                currentId,
+                VibeNetTransport.TCP,
+                ex);
+        }
+    }
+
+    private void PublishDisconnectEvent(
+        VibeNetConnectionInfo connection,
+        VibeNetDisconnectReason reason,
+        string detail)
+    {
+        disconnectedQueue.TryEnqueue(
+            new VibeNetDisconnectInfo(
+                connection,
+                reason,
+                detail,
+                DateTime.UtcNow));
+    }
+
+    private static string GetConnectTimeoutMessage(VibeNetOperation operation)
+    {
+        switch (operation)
+        {
+            case VibeNetOperation.UdpHandshake:
+                return "UDP registration acknowledgement was not received.";
+            case VibeNetOperation.ReadyHandshake:
+                return "READY acknowledgement was not received.";
+            default:
+                return "Connection attempt timed out.";
+        }
+    }
+
+    private static VibeNetTransport? GetFailureTransport(VibeNetOperation operation)
+    {
+        switch (operation)
+        {
+            case VibeNetOperation.TcpConnect:
+            case VibeNetOperation.HelloHandshake:
+            case VibeNetOperation.ReadyHandshake:
+            case VibeNetOperation.TcpSend:
+            case VibeNetOperation.TcpReceive:
+            case VibeNetOperation.Heartbeat:
+            case VibeNetOperation.Disconnect:
+                return VibeNetTransport.TCP;
+            case VibeNetOperation.UdpHandshake:
+            case VibeNetOperation.UdpSend:
+            case VibeNetOperation.UdpReceive:
+                return VibeNetTransport.UDP;
+            default:
+                return null;
+        }
+    }
+
+    private VibeNetConnectResult FailStart(
+        VibeNetFailureCode failure,
+        VibeNetOperation operation,
+        string detail,
+        Exception? exception = null)
     {
         CloseClientSockets();
         Lifetime.Cancel();
@@ -2699,12 +2794,22 @@ public sealed class VibeNetClient : VibeNetNode
         lock (stateLock)
         {
             state =
-                failure == VibeNetConnectFailure.Cancelled
+                failure == VibeNetFailureCode.Aborted
                 ? VibeNetConnectionState.Disconnected
                 : VibeNetConnectionState.Faulted;
         }
 
-        return VibeNetConnectResult.Failed(failure, detail);
+        Guid? failedConnectionId = connectionId == Guid.Empty ? (Guid?)null : connectionId;
+
+        return VibeNetConnectResult.Failed(
+            new VibeNetFailure(
+                failedConnectionId,
+                GetFailureTransport(operation),
+                failure,
+                operation,
+                detail,
+                exception,
+                DateTime.UtcNow));
     }
 
     private void CloseClientSockets()
@@ -3135,70 +3240,47 @@ internal static class VibeNetProtocol
     }
 }
 
+internal enum BoundedQueueOverflowMode
+{
+    RejectNew,
+    DropOldest
+}
+
 internal sealed class BoundedQueue<T>
 {
     private readonly object sync = new object();
     private readonly Queue<T> queue = new Queue<T>();
     private readonly int capacity;
+    private readonly BoundedQueueOverflowMode overflowMode;
 
-    public BoundedQueue(int capacity)
+    public BoundedQueue(
+        int capacity,
+        BoundedQueueOverflowMode overflowMode = BoundedQueueOverflowMode.RejectNew)
     {
         if (capacity <= 0)
             throw new ArgumentOutOfRangeException(nameof(capacity));
 
         this.capacity = capacity;
+        this.overflowMode = overflowMode;
     }
 
     public bool TryEnqueue(T item)
     {
         lock (sync)
         {
-            if (queue.Count >= capacity)
-                return false;
-
-            queue.Enqueue(item);
-            return true;
-        }
-    }
-
-    public bool TryDequeue(out T item)
-    {
-        lock (sync)
-        {
-            if (queue.Count == 0)
+            if (overflowMode == BoundedQueueOverflowMode.RejectNew)
             {
-                item = default!;
-                return false;
+                if (queue.Count >= capacity)
+                    return false;
+            }
+            else
+            {
+                while (queue.Count >= capacity)
+                    queue.Dequeue();
             }
 
-            item = queue.Dequeue();
-            return true;
-        }
-    }
-}
-
-internal sealed class DropOldestQueue<T>
-{
-    private readonly object sync = new object();
-    private readonly Queue<T> queue = new Queue<T>();
-    private readonly int capacity;
-
-    public DropOldestQueue(int capacity)
-    {
-        if (capacity <= 0)
-            throw new ArgumentOutOfRangeException(nameof(capacity));
-
-        this.capacity = capacity;
-    }
-
-    public void EnqueueDroppingOldest(T item)
-    {
-        lock (sync)
-        {
-            while (queue.Count >= capacity)
-                queue.Dequeue();
-
             queue.Enqueue(item);
+            return true;
         }
     }
 
@@ -3222,55 +3304,45 @@ internal enum ServerQueueEnqueueKind
 {
     Enqueued,
     Dropped,
-    DisconnectCurrent,
-    DisconnectOther
+    DisconnectCurrent
 }
 
 internal readonly struct ServerQueueEnqueueResult
 {
     public ServerQueueEnqueueKind Kind { get; }
-    public Guid OffenderId { get; }
 
-    public ServerQueueEnqueueResult(ServerQueueEnqueueKind kind, Guid offenderId = default)
+    public ServerQueueEnqueueResult(ServerQueueEnqueueKind kind)
     {
         Kind = kind;
-        OffenderId = offenderId;
     }
 }
 
-internal sealed class FairServerMessageQueue
+internal sealed class ServerMessageQueue
 {
     private readonly struct OwnedMessage
     {
+        public Guid OwnerId { get; }
         public VibeNetMessage Message { get; }
         public bool Reliable { get; }
 
-        public OwnedMessage(VibeNetMessage message, bool reliable)
+        public OwnedMessage(Guid ownerId, VibeNetMessage message, bool reliable)
         {
+            OwnerId = ownerId;
             Message = message;
             Reliable = reliable;
         }
     }
 
     private readonly object sync = new object();
-    private readonly int totalCapacity;
     private readonly int perOwnerReliableCapacity;
-
-    private readonly Dictionary<Guid, Queue<OwnedMessage>> queuesByOwner =
-        new Dictionary<Guid, Queue<OwnedMessage>>();
-
+    private readonly int totalCapacity;
     private readonly Dictionary<Guid, int> countsByOwner =
         new Dictionary<Guid, int>();
-
     private readonly Dictionary<Guid, int> reliableCountsByOwner =
         new Dictionary<Guid, int>();
+    private Queue<OwnedMessage> queue = new Queue<OwnedMessage>();
 
-    private readonly Queue<Guid> readyOwners = new Queue<Guid>();
-    private readonly HashSet<Guid> scheduledOwners = new HashSet<Guid>();
-
-    private int totalCount;
-
-    public FairServerMessageQueue(int totalCapacity, int maxClients)
+    public ServerMessageQueue(int totalCapacity, int maxClients)
     {
         if (totalCapacity <= 0)
             throw new ArgumentOutOfRangeException(nameof(totalCapacity));
@@ -3289,30 +3361,15 @@ internal sealed class FairServerMessageQueue
                 reliableCountsByOwner.TryGetValue(ownerId, out int count) ? count : 0;
 
             if (reliable && ownerReliableCount >= perOwnerReliableCapacity)
-                return new ServerQueueEnqueueResult(ServerQueueEnqueueKind.DisconnectCurrent, ownerId);
+                return new ServerQueueEnqueueResult(ServerQueueEnqueueKind.DisconnectCurrent);
 
-            if (totalCount >= totalCapacity)
+            if (queue.Count >= totalCapacity)
             {
                 if (!reliable)
                     return new ServerQueueEnqueueResult(ServerQueueEnqueueKind.Dropped);
 
-                if (TryDropOneUnreliableUnlocked())
-                {
-                    EnqueueUnlocked(ownerId, message, true);
-                    return new ServerQueueEnqueueResult(ServerQueueEnqueueKind.Enqueued);
-                }
-
-                Guid offenderId = ownerReliableCount > 0 ? ownerId : FindLargestReliableOwner();
-                if (offenderId == Guid.Empty)
-                    return new ServerQueueEnqueueResult(ServerQueueEnqueueKind.DisconnectCurrent, ownerId);
-
-                RemoveOwnerUnlocked(offenderId);
-
-                if (offenderId == ownerId)
-                    return new ServerQueueEnqueueResult(ServerQueueEnqueueKind.DisconnectCurrent, ownerId);
-
-                EnqueueUnlocked(ownerId, message, true);
-                return new ServerQueueEnqueueResult(ServerQueueEnqueueKind.DisconnectOther, offenderId);
+                if (!TryDropFirstUnreliableUnlocked())
+                    return new ServerQueueEnqueueResult(ServerQueueEnqueueKind.DisconnectCurrent);
             }
 
             EnqueueUnlocked(ownerId, message, reliable);
@@ -3324,49 +3381,16 @@ internal sealed class FairServerMessageQueue
     {
         lock (sync)
         {
-            while (readyOwners.Count > 0)
+            if (queue.Count == 0)
             {
-                Guid ownerId = readyOwners.Dequeue();
-                scheduledOwners.Remove(ownerId);
-
-                if (!queuesByOwner.TryGetValue(ownerId, out Queue<OwnedMessage>? queue) ||
-                    queue.Count == 0)
-                {
-                    continue;
-                }
-
-                OwnedMessage ownedMessage = queue.Dequeue();
-                message = ownedMessage.Message;
-                totalCount--;
-
-                if (ownedMessage.Reliable &&
-                    reliableCountsByOwner.TryGetValue(ownerId, out int reliableCount))
-                {
-                    if (reliableCount <= 1)
-                        reliableCountsByOwner.Remove(ownerId);
-                    else
-                        reliableCountsByOwner[ownerId] = reliableCount - 1;
-                }
-
-                int remainingOwnerCount = countsByOwner[ownerId] - 1;
-                if (remainingOwnerCount <= 0)
-                {
-                    countsByOwner.Remove(ownerId);
-                    queuesByOwner.Remove(ownerId);
-                    reliableCountsByOwner.Remove(ownerId);
-                }
-                else
-                {
-                    countsByOwner[ownerId] = remainingOwnerCount;
-                    readyOwners.Enqueue(ownerId);
-                    scheduledOwners.Add(ownerId);
-                }
-
-                return true;
+                message = default!;
+                return false;
             }
 
-            message = default!;
-            return false;
+            OwnedMessage ownedMessage = queue.Dequeue();
+            DecrementCountsUnlocked(ownedMessage.OwnerId, ownedMessage.Reliable);
+            message = ownedMessage.Message;
+            return true;
         }
     }
 
@@ -3378,107 +3402,76 @@ internal sealed class FairServerMessageQueue
 
     private void EnqueueUnlocked(Guid ownerId, VibeNetMessage message, bool reliable)
     {
-        if (!queuesByOwner.TryGetValue(ownerId, out Queue<OwnedMessage>? queue))
-        {
-            queue = new Queue<OwnedMessage>();
-            queuesByOwner.Add(ownerId, queue);
-        }
-
-        queue.Enqueue(new OwnedMessage(message, reliable));
-        totalCount++;
+        queue.Enqueue(new OwnedMessage(ownerId, message, reliable));
         countsByOwner[ownerId] = countsByOwner.TryGetValue(ownerId, out int count) ? count + 1 : 1;
         if (reliable)
-        {
-            reliableCountsByOwner[ownerId] =
-                reliableCountsByOwner.TryGetValue(ownerId, out int reliableCount)
+            reliableCountsByOwner[ownerId] = reliableCountsByOwner.TryGetValue(ownerId, out int reliableCount)
                 ? reliableCount + 1
                 : 1;
-        }
-
-        if (scheduledOwners.Add(ownerId))
-            readyOwners.Enqueue(ownerId);
-    }
-
-    private Guid FindLargestReliableOwner()
-    {
-        Guid largestOwner = Guid.Empty;
-        int largestCount = -1;
-
-        foreach (KeyValuePair<Guid, int> pair in reliableCountsByOwner)
-        {
-            if (pair.Value > largestCount)
-            {
-                largestOwner = pair.Key;
-                largestCount = pair.Value;
-            }
-        }
-
-        return largestOwner;
     }
 
     private void RemoveOwnerUnlocked(Guid ownerId)
     {
-        if (!countsByOwner.TryGetValue(ownerId, out int ownerCount))
+        if (!countsByOwner.ContainsKey(ownerId))
             return;
 
-        countsByOwner.Remove(ownerId);
-        reliableCountsByOwner.Remove(ownerId);
-        queuesByOwner.Remove(ownerId);
-        scheduledOwners.Remove(ownerId);
-        totalCount -= ownerCount;
-        if (totalCount < 0)
-            totalCount = 0;
-    }
-
-    private bool TryDropOneUnreliableUnlocked()
-    {
-        foreach (Guid ownerId in countsByOwner.Keys.ToArray())
+        Queue<OwnedMessage> rebuilt = new Queue<OwnedMessage>(queue.Count);
+        while (queue.Count > 0)
         {
-            if (!queuesByOwner.TryGetValue(ownerId, out Queue<OwnedMessage>? queue) ||
-                queue.Count == 0)
+            OwnedMessage ownedMessage = queue.Dequeue();
+            if (ownedMessage.OwnerId == ownerId)
             {
+                DecrementCountsUnlocked(ownedMessage.OwnerId, ownedMessage.Reliable);
                 continue;
             }
 
-            Queue<OwnedMessage> rebuilt = new Queue<OwnedMessage>(queue.Count);
-            bool dropped = false;
-
-            while (queue.Count > 0)
-            {
-                OwnedMessage message = queue.Dequeue();
-                if (!dropped && !message.Reliable)
-                {
-                    dropped = true;
-                    totalCount--;
-                    continue;
-                }
-
-                rebuilt.Enqueue(message);
-            }
-
-            if (!dropped)
-            {
-                queuesByOwner[ownerId] = rebuilt;
-                continue;
-            }
-
-            if (rebuilt.Count == 0)
-            {
-                countsByOwner.Remove(ownerId);
-                reliableCountsByOwner.Remove(ownerId);
-                queuesByOwner.Remove(ownerId);
-                scheduledOwners.Remove(ownerId);
-            }
-            else
-            {
-                countsByOwner[ownerId] = rebuilt.Count;
-                queuesByOwner[ownerId] = rebuilt;
-            }
-
-            return true;
+            rebuilt.Enqueue(ownedMessage);
         }
 
-        return false;
+        queue = rebuilt;
+    }
+
+    private bool TryDropFirstUnreliableUnlocked()
+    {
+        Queue<OwnedMessage> rebuilt = new Queue<OwnedMessage>(queue.Count);
+        bool dropped = false;
+        while (queue.Count > 0)
+        {
+            OwnedMessage ownedMessage = queue.Dequeue();
+            if (!dropped && !ownedMessage.Reliable)
+            {
+                DecrementCountsUnlocked(ownedMessage.OwnerId, false);
+                dropped = true;
+                continue;
+            }
+
+            rebuilt.Enqueue(ownedMessage);
+        }
+
+        queue = rebuilt;
+        return dropped;
+    }
+
+    private void DecrementCountsUnlocked(Guid ownerId, bool reliable)
+    {
+        if (countsByOwner.TryGetValue(ownerId, out int count))
+        {
+            if (count <= 1)
+                countsByOwner.Remove(ownerId);
+            else
+                countsByOwner[ownerId] = count - 1;
+        }
+
+        if (!reliable)
+            return;
+
+        if (reliableCountsByOwner.TryGetValue(ownerId, out int reliableCount))
+        {
+            if (reliableCount <= 1)
+                reliableCountsByOwner.Remove(ownerId);
+            else
+                reliableCountsByOwner[ownerId] = reliableCount - 1;
+        }
     }
 }
 

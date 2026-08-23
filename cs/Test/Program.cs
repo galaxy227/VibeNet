@@ -17,12 +17,14 @@ internal static class Program
             new TestCase("Basic_HandshakeMessagingDisconnect", TestBasicHandshakeMessagingDisconnectAsync),
             new TestCase("Lifecycle_SingleUseInstances", TestSingleUseInstancesAsync),
             new TestCase("Server_CapacityRejectsExtraClient", TestServerCapacityRejectsExtraClientAsync),
+            new TestCase("Cancellation_ClientStartThrows", TestClientStartCancellationThrowsAsync),
             new TestCase("Validation_InvalidEnumsAndTimeoutsThrow", TestInvalidEnumsAndTimeoutsThrowAsync),
             new TestCase("Handshake_UDPRequiredOnServer", TestUdpRequiredOnServerAsync),
             new TestCase("Protocol_ServerRejectsEarlyPong", TestServerRejectsEarlyPongAsync),
             new TestCase("Protocol_ServerRejectsMalformedClientDisconnect", TestServerRejectsMalformedClientDisconnectAsync),
             new TestCase("Protocol_ClientRejectsInvalidServerDisconnectCode", TestClientRejectsInvalidServerDisconnectCodeAsync),
-            new TestCase("Queue_UDPPressureDoesNotFaultOtherClientTCP", TestUdpPressureDoesNotFaultOtherClientTcpAsync)
+            new TestCase("Queue_UDPPressureDoesNotFaultOtherClientTCP", TestUdpPressureDoesNotFaultOtherClientTcpAsync),
+            new TestCase("Queue_ReliableOverflowDisconnectsCurrentSender", TestReliableOverflowDisconnectsCurrentSenderAsync)
         };
 
         int passed = 0;
@@ -67,17 +69,25 @@ internal static class Program
             Assert(client.Connection.RemoteAddress != null, "Client remote address should be populated.");
             Assert(client.Connection.ConnectedAtUtc.HasValue, "Client connected timestamp should be set.");
 
-            await client.SendAsync(Encoding.UTF8.GetBytes("c-tcp"), VibeNetTransport.TCP).ConfigureAwait(false);
-            await client.SendAsync(Encoding.UTF8.GetBytes("c-udp"), VibeNetTransport.UDP).ConfigureAwait(false);
+            Assert(
+                await client.SendAsync(Encoding.UTF8.GetBytes("c-tcp"), VibeNetTransport.TCP).ConfigureAwait(false),
+                "Client TCP send failed.");
+            Assert(
+                await client.SendAsync(Encoding.UTF8.GetBytes("c-udp"), VibeNetTransport.UDP).ConfigureAwait(false),
+                "Client UDP send failed.");
 
             VibeNetMessage[] serverMessages = await WaitForMessagesAsync(server, 2).ConfigureAwait(false);
             Assert(serverMessages.Any(message => message.Transport == VibeNetTransport.TCP), "Server missing TCP message.");
             Assert(serverMessages.Any(message => message.Transport == VibeNetTransport.UDP), "Server missing UDP message.");
 
-            await server.SendAsync(client.ConnectionId, Encoding.UTF8.GetBytes("s-tcp"), VibeNetTransport.TCP)
-                .ConfigureAwait(false);
-            await server.SendAsync(client.ConnectionId, Encoding.UTF8.GetBytes("s-udp"), VibeNetTransport.UDP)
-                .ConfigureAwait(false);
+            Assert(
+                await server.SendAsync(client.ConnectionId, Encoding.UTF8.GetBytes("s-tcp"), VibeNetTransport.TCP)
+                    .ConfigureAwait(false),
+                "Server TCP send failed.");
+            Assert(
+                await server.SendAsync(client.ConnectionId, Encoding.UTF8.GetBytes("s-udp"), VibeNetTransport.UDP)
+                    .ConfigureAwait(false),
+                "Server UDP send failed.");
 
             VibeNetMessage[] clientMessages = await WaitForMessagesAsync(client, 2).ConfigureAwait(false);
             Assert(clientMessages.Any(message => message.Transport == VibeNetTransport.TCP), "Client missing TCP message.");
@@ -155,7 +165,10 @@ internal static class Program
 
             VibeNetConnectResult secondResult = await second.StartAsync().ConfigureAwait(false);
             Assert(!secondResult.Success, "Second client should have been rejected.");
-            Assert(secondResult.Failure == VibeNetConnectFailure.ServerRejected, "Expected ServerRejected.");
+            Assert(
+                secondResult.Failure.HasValue &&
+                secondResult.Failure.Value.Code == VibeNetFailureCode.ServerRejected,
+                "Expected ServerRejected.");
         }
         finally
         {
@@ -165,6 +178,33 @@ internal static class Program
             first.Dispose();
             second.Dispose();
             server.Dispose();
+        }
+    }
+
+    private static async Task TestClientStartCancellationThrowsAsync()
+    {
+        VibeNetClient client = new VibeNetClient("127.0.0.1", 7777, null, CreateDefaultConfig());
+        using CancellationTokenSource cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        try
+        {
+            bool canceled = false;
+
+            try
+            {
+                await client.StartAsync(cancellation.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                canceled = true;
+            }
+
+            Assert(canceled, "Expected StartAsync to throw OperationCanceledException.");
+        }
+        finally
+        {
+            client.Dispose();
         }
     }
 
@@ -281,7 +321,7 @@ internal static class Program
             Assert(server.ConnectedClientCount == 0, "Early PONG should not complete the session.");
 
             await WaitUntilAsync(
-                () => DrainErrors(server).Any(error => error.Code == VibeNetErrorCode.ProtocolError),
+                () => DrainFailures(server).Any(failure => failure.Code == VibeNetFailureCode.ProtocolError),
                 TimeSpan.FromSeconds(2),
                 "protocol error").ConfigureAwait(false);
         }
@@ -376,7 +416,7 @@ internal static class Program
             maxTcpPayloadBytes: 1024 * 1024,
             maxUdpPayloadBytes: 1200,
             maxQueuedMessages: 1,
-            maxQueuedErrors: 64,
+            maxQueuedFailures: 64,
             maxQueuedEvents: 64,
             addressMode: VibeNetAddressMode.IPv4);
 
@@ -393,8 +433,12 @@ internal static class Program
             await WaitUntilAsync(() => server.ConnectedClientCount == 2, TimeSpan.FromSeconds(2), "two clients")
                 .ConfigureAwait(false);
 
-            await client1.SendAsync(Encoding.UTF8.GetBytes("udp-fill"), VibeNetTransport.UDP).ConfigureAwait(false);
-            await client2.SendAsync(Encoding.UTF8.GetBytes("tcp-keep"), VibeNetTransport.TCP).ConfigureAwait(false);
+            Assert(
+                await client1.SendAsync(Encoding.UTF8.GetBytes("udp-fill"), VibeNetTransport.UDP).ConfigureAwait(false),
+                "Client1 UDP send failed.");
+            Assert(
+                await client2.SendAsync(Encoding.UTF8.GetBytes("tcp-keep"), VibeNetTransport.TCP).ConfigureAwait(false),
+                "Client2 TCP send failed.");
 
             VibeNetMessage message = await WaitForMessageAsync(server).ConfigureAwait(false);
             Assert(
@@ -416,13 +460,80 @@ internal static class Program
         }
     }
 
-    private static IEnumerable<VibeNetErrorInfo> DrainErrors(VibeNetNode node)
+    private static async Task TestReliableOverflowDisconnectsCurrentSenderAsync()
     {
-        List<VibeNetErrorInfo> errors = new List<VibeNetErrorInfo>();
-        while (node.TryDequeueError(out VibeNetErrorInfo error))
-            errors.Add(error);
+        int port = GetFreePort();
+        VibeNetConfiguration config = new VibeNetConfiguration(
+            clientConnectTimeout: TimeSpan.FromSeconds(5),
+            udpHandshakeInterval: TimeSpan.FromMilliseconds(50),
+            udpHandshakeTimeout: TimeSpan.FromSeconds(2),
+            serverConnectTimeout: TimeSpan.FromSeconds(2),
+            tcpHeartbeatInterval: TimeSpan.FromMilliseconds(100),
+            tcpHeartbeatTimeout: TimeSpan.FromMilliseconds(400),
+            maxTcpPayloadBytes: 1024 * 1024,
+            maxUdpPayloadBytes: 1200,
+            maxQueuedMessages: 1,
+            maxQueuedFailures: 64,
+            maxQueuedEvents: 64,
+            addressMode: VibeNetAddressMode.IPv4);
 
-        return errors;
+        VibeNetServer server = new VibeNetServer(port, null, 8, IPAddress.Loopback, config);
+        VibeNetClient first = new VibeNetClient("127.0.0.1", port, null, config);
+        VibeNetClient second = new VibeNetClient("127.0.0.1", port, null, config);
+
+        try
+        {
+            Assert((await server.StartAsync().ConfigureAwait(false)).Success, "Server failed to start.");
+            Assert((await first.StartAsync().ConfigureAwait(false)).Success, "First client failed to connect.");
+            Assert((await second.StartAsync().ConfigureAwait(false)).Success, "Second client failed to connect.");
+
+            await WaitUntilAsync(() => server.ConnectedClientCount == 2, TimeSpan.FromSeconds(2), "two clients")
+                .ConfigureAwait(false);
+
+            Assert(
+                await first.SendAsync(Encoding.UTF8.GetBytes("fill"), VibeNetTransport.TCP).ConfigureAwait(false),
+                "First client TCP fill send failed.");
+
+            await Task.Delay(100).ConfigureAwait(false);
+
+            Assert(
+                await second.SendAsync(Encoding.UTF8.GetBytes("overflow"), VibeNetTransport.TCP).ConfigureAwait(false),
+                "Second client TCP overflow send failed before server processed it.");
+
+            VibeNetDisconnectInfo serverDisconnect = await WaitForDisconnectAsync(server).ConfigureAwait(false);
+            Assert(
+                serverDisconnect.Connection.Id == second.ConnectionId,
+                "Reliable overflow should disconnect the current sender, not another client.");
+            Assert(
+                serverDisconnect.Reason == VibeNetDisconnectReason.ResourceLimit,
+                "Reliable overflow should produce ResourceLimit.");
+
+            VibeNetDisconnectInfo clientDisconnect = await WaitForDisconnectAsync(second).ConfigureAwait(false);
+            Assert(
+                clientDisconnect.Reason == VibeNetDisconnectReason.ResourceLimit ||
+                clientDisconnect.Reason == VibeNetDisconnectReason.ConnectionLost,
+                "Client should observe a faulted disconnect after reliable overflow.");
+
+            Assert(first.IsConnected, "First client should remain connected.");
+        }
+        finally
+        {
+            await SafeDisconnectAsync(first).ConfigureAwait(false);
+            await SafeDisconnectAsync(second).ConfigureAwait(false);
+            await SafeStopAsync(server).ConfigureAwait(false);
+            first.Dispose();
+            second.Dispose();
+            server.Dispose();
+        }
+    }
+
+    private static IEnumerable<VibeNetFailure> DrainFailures(VibeNetNode node)
+    {
+        List<VibeNetFailure> failures = new List<VibeNetFailure>();
+        while (node.TryDequeueFailure(out VibeNetFailure failure))
+            failures.Add(failure);
+
+        return failures;
     }
 
     private static async Task<VibeNetDisconnectInfo> WaitForDisconnectAsync(VibeNetServer server)
@@ -594,7 +705,7 @@ internal static class Program
             maxTcpPayloadBytes: 1024 * 1024,
             maxUdpPayloadBytes: 1200,
             maxQueuedMessages: 256,
-            maxQueuedErrors: 64,
+            maxQueuedFailures: 64,
             maxQueuedEvents: 64,
             addressMode: VibeNetAddressMode.IPv4);
     }
@@ -611,7 +722,7 @@ internal static class Program
             maxTcpPayloadBytes: 1024 * 1024,
             maxUdpPayloadBytes: 1200,
             maxQueuedMessages: 64,
-            maxQueuedErrors: 64,
+            maxQueuedFailures: 64,
             maxQueuedEvents: 64,
             addressMode: VibeNetAddressMode.IPv4);
     }
