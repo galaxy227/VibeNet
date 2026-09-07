@@ -6,9 +6,12 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="Load.cs" />
     <Compile Include="../VibeNet.cs" Link="VibeNet.cs" />
   </ItemGroup>
 </Project>

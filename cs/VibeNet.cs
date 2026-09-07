@@ -1,3694 +1,2185 @@
+// VibeNet 1. No peer identity authentication: an active handshake MITM is possible.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-
 #nullable enable
-
 namespace VibeNet
 {
-
-public enum VibeNetTransport
-{
-    TCP,
-    UDP
-}
-
-public enum VibeNetAddressMode
-{
-    IPv4,
-    IPv6,
-    DualStack
-}
-
-public enum VibeNetConnectionState
-{
-    Created,
-    Connecting,
-    Connected,
-    Disconnecting,
-    Disconnected,
-    Faulted
-}
-
-public enum VibeNetFailureCode
-{
-    None,
-    Aborted,
-    Timeout,
-    DnsResolutionFailed,
-    ConnectionRefused,
-    ServerRejected,
-    ProtocolMismatch,
-    HandshakeFailed,
-    ProtocolError,
-    SocketError,
-    SendFailure,
-    ReceiveFailure,
-    QueueOverflow,
-    InternalError
-}
-
-public enum VibeNetDisconnectReason
-{
-    LocalRequested,
-    RemoteRequested,
-    Timeout,
-    ConnectionLost,
-    ProtocolError,
-    ResourceLimit,
-    ServerStopped
-}
-
-public enum VibeNetOperation
-{
-    None,
-    Start,
-    Resolve,
-    Accept,
-    TcpConnect,
-    HelloHandshake,
-    UdpHandshake,
-    ReadyHandshake,
-    TcpSend,
-    UdpSend,
-    TcpReceive,
-    UdpReceive,
-    Heartbeat,
-    Disconnect,
-    Shutdown
-}
-
-public readonly struct VibeNetConnectResult
-{
-    public bool Success { get; }
-    public VibeNetFailure? Failure { get; }
-
-    private VibeNetConnectResult(bool success, VibeNetFailure? failure)
+    public enum VibeNetTransport
     {
-        Success = success;
-        Failure = failure;
+        TCP, UDP
     }
-
-    public static VibeNetConnectResult Succeeded()
+    public enum SendResult
     {
-        return new VibeNetConnectResult(true, null);
+        Sent, NotConnected, Backpressured, Failed
     }
-
-    public static VibeNetConnectResult Failed(VibeNetFailure failure)
+    public enum ConnectionState
     {
-        return new VibeNetConnectResult(false, failure);
+        Created, Connecting, Connected, Closing, Closed
     }
-}
-
-public readonly struct VibeNetMessage
-{
-    public Guid? ConnectionId { get; }
-    public VibeNetTransport Transport { get; }
-    public byte[] Data { get; }
-
-    public VibeNetMessage(Guid? connectionId, VibeNetTransport transport, byte[] data)
+    public enum FailureCode
     {
-        ConnectionId = connectionId;
-        Transport = transport;
-        Data = data ?? throw new ArgumentNullException(nameof(data));
+        Socket, Protocol, Integrity, Handshake, Timeout, ResourceLimit, UnsupportedRuntime, Internal
     }
-}
-
-public readonly struct VibeNetConnectionInfo
-{
-    public Guid Id { get; }
-    public IPAddress? RemoteAddress { get; }
-    public int TCPRemotePort { get; }
-    public int UDPRemotePort { get; }
-    public VibeNetConnectionState State { get; }
-    public DateTime TCPConnectedAtUtc { get; }
-    public DateTime? ConnectedAtUtc { get; }
-    public DateTime LastActivityUtc { get; }
-
-    public VibeNetConnectionInfo(
-        Guid id,
-        IPAddress? remoteAddress,
-        int tcpRemotePort,
-        int udpRemotePort,
-        VibeNetConnectionState state,
-        DateTime tcpConnectedAtUtc,
-        DateTime? connectedAtUtc,
-        DateTime lastActivityUtc)
+    public enum DisconnectReason
     {
-        Id = id;
-        RemoteAddress = remoteAddress;
-        TCPRemotePort = tcpRemotePort;
-        UDPRemotePort = udpRemotePort;
-        State = state;
-        TCPConnectedAtUtc = tcpConnectedAtUtc;
-        ConnectedAtUtc = connectedAtUtc;
-        LastActivityUtc = lastActivityUtc;
+        LocalRequested, RemoteRequested, ServerStopped, ConnectionLost, Timeout, ProtocolError, ResourceLimit
     }
-}
-
-public readonly struct VibeNetDisconnectInfo
-{
-    public VibeNetConnectionInfo Connection { get; }
-    public VibeNetDisconnectReason Reason { get; }
-    public string Detail { get; }
-    public DateTime OccurredAtUtc { get; }
-
-    public VibeNetDisconnectInfo(
-        VibeNetConnectionInfo connection,
-        VibeNetDisconnectReason reason,
-        string detail,
-        DateTime occurredAtUtc)
+    public sealed class VibeNetLimits
     {
-        Connection = connection;
-        Reason = reason;
-        Detail = detail ?? string.Empty;
-        OccurredAtUtc = occurredAtUtc;
-    }
-}
-
-public readonly struct VibeNetFailure
-{
-    public Guid? ConnectionId { get; }
-    public VibeNetTransport? Transport { get; }
-    public VibeNetFailureCode Code { get; }
-    public VibeNetOperation Operation { get; }
-    public string Message { get; }
-    public Exception? Exception { get; }
-    public DateTime OccurredAtUtc { get; }
-
-    public VibeNetFailure(
-        Guid? connectionId,
-        VibeNetTransport? transport,
-        VibeNetFailureCode code,
-        VibeNetOperation operation,
-        string message,
-        Exception? exception,
-        DateTime occurredAtUtc)
-    {
-        ConnectionId = connectionId;
-        Transport = transport;
-        Code = code;
-        Operation = operation;
-        Message = message ?? string.Empty;
-        Exception = exception;
-        OccurredAtUtc = occurredAtUtc;
-    }
-}
-
-public sealed class VibeNetConfiguration
-{
-    private static readonly TimeSpan MaximumTimerDuration =
-        TimeSpan.FromMilliseconds(int.MaxValue - 1);
-
-    public TimeSpan ClientConnectTimeout { get; }
-    public TimeSpan UDPHandshakeInterval { get; }
-    public TimeSpan UDPHandshakeTimeout { get; }
-    public TimeSpan ServerConnectTimeout { get; }
-    public TimeSpan TCPHeartbeatInterval { get; }
-    public TimeSpan TCPHeartbeatTimeout { get; }
-
-    public int MaxTCPPayloadBytes { get; }
-    public int MaxUDPPayloadBytes { get; }
-    public int MaxQueuedMessages { get; }
-    public int MaxQueuedFailures { get; }
-    public int MaxQueuedEvents { get; }
-
-    public VibeNetAddressMode AddressMode { get; }
-
-    public VibeNetConfiguration(
-        TimeSpan? clientConnectTimeout = null,
-        TimeSpan? udpHandshakeInterval = null,
-        TimeSpan? udpHandshakeTimeout = null,
-        TimeSpan? serverConnectTimeout = null,
-        TimeSpan? tcpHeartbeatInterval = null,
-        TimeSpan? tcpHeartbeatTimeout = null,
-        int maxTcpPayloadBytes = 1024 * 1024,
-        int maxUdpPayloadBytes = 1200,
-        int maxQueuedMessages = 4096,
-        int maxQueuedFailures = 256,
-        int maxQueuedEvents = 1024,
-        VibeNetAddressMode addressMode = VibeNetAddressMode.IPv4)
-    {
-        ClientConnectTimeout = clientConnectTimeout ?? TimeSpan.FromSeconds(5);
-        UDPHandshakeInterval = udpHandshakeInterval ?? TimeSpan.FromMilliseconds(500);
-        UDPHandshakeTimeout = udpHandshakeTimeout ?? TimeSpan.FromSeconds(3);
-        ServerConnectTimeout = serverConnectTimeout ?? TimeSpan.FromSeconds(10);
-        TCPHeartbeatInterval = tcpHeartbeatInterval ?? TimeSpan.FromSeconds(2);
-        TCPHeartbeatTimeout = tcpHeartbeatTimeout ?? TimeSpan.FromSeconds(10);
-
-        MaxTCPPayloadBytes = maxTcpPayloadBytes;
-        MaxUDPPayloadBytes = maxUdpPayloadBytes;
-        MaxQueuedMessages = maxQueuedMessages;
-        MaxQueuedFailures = maxQueuedFailures;
-        MaxQueuedEvents = maxQueuedEvents;
-        AddressMode = addressMode;
-
-        Validate();
-    }
-
-    private void Validate()
-    {
-        ValidateDuration(ClientConnectTimeout, nameof(ClientConnectTimeout));
-        ValidateDuration(UDPHandshakeInterval, nameof(UDPHandshakeInterval));
-        ValidateDuration(UDPHandshakeTimeout, nameof(UDPHandshakeTimeout));
-        ValidateDuration(ServerConnectTimeout, nameof(ServerConnectTimeout));
-        ValidateDuration(TCPHeartbeatInterval, nameof(TCPHeartbeatInterval));
-        ValidateDuration(TCPHeartbeatTimeout, nameof(TCPHeartbeatTimeout));
-
-        if (TCPHeartbeatTimeout <= TCPHeartbeatInterval)
-            throw new ArgumentOutOfRangeException(nameof(TCPHeartbeatTimeout));
-
-        if (MaxTCPPayloadBytes <= 0)
-            throw new ArgumentOutOfRangeException(nameof(MaxTCPPayloadBytes));
-
-        if (MaxUDPPayloadBytes <= 0 ||
-            MaxUDPPayloadBytes > VibeNetProtocol.MaxUserUdpPayloadBytes)
-        {
-            throw new ArgumentOutOfRangeException(nameof(MaxUDPPayloadBytes));
-        }
-
-        if (MaxQueuedMessages <= 0)
-            throw new ArgumentOutOfRangeException(nameof(MaxQueuedMessages));
-
-        if (MaxQueuedFailures <= 0)
-            throw new ArgumentOutOfRangeException(nameof(MaxQueuedFailures));
-
-        if (MaxQueuedEvents <= 0)
-            throw new ArgumentOutOfRangeException(nameof(MaxQueuedEvents));
-
-        if (!Enum.IsDefined(typeof(VibeNetAddressMode), AddressMode))
-            throw new ArgumentOutOfRangeException(nameof(AddressMode));
-    }
-
-    private static void ValidateDuration(TimeSpan value, string parameterName)
-    {
-        if (value <= TimeSpan.Zero || value > MaximumTimerDuration)
-            throw new ArgumentOutOfRangeException(parameterName);
-    }
-}
-
-public abstract class VibeNetNode : IDisposable
-{
-    public int TCPPort { get; }
-    public int UDPPort { get; }
-    public VibeNetConfiguration Configuration { get; }
-
-    private readonly BoundedQueue<VibeNetFailure> failureQueue;
-
-    protected readonly CancellationTokenSource Lifetime = new CancellationTokenSource();
-
-    protected VibeNetNode(int tcpPort, int? udpPort, VibeNetConfiguration? configuration)
-    {
-        ValidatePort(tcpPort, nameof(tcpPort));
-
-        int actualUdpPort = udpPort ?? tcpPort;
-        ValidatePort(actualUdpPort, nameof(udpPort));
-
-        TCPPort = tcpPort;
-        UDPPort = actualUdpPort;
-        Configuration = configuration ?? new VibeNetConfiguration();
-        failureQueue = new BoundedQueue<VibeNetFailure>(
-            Configuration.MaxQueuedFailures,
-            BoundedQueueOverflowMode.DropOldest);
-    }
-
-    public bool TryDequeueFailure(out VibeNetFailure failure)
-    {
-        return failureQueue.TryDequeue(out failure);
-    }
-
-    public abstract bool TryDequeueMessage(out VibeNetMessage message);
-
-    public abstract Task<VibeNetConnectResult> StartAsync(
-        CancellationToken cancellationToken = default);
-
-    public abstract void Dispose();
-
-    protected void ReportFailure(
-        VibeNetFailureCode code,
-        VibeNetOperation operation,
-        string message,
-        Guid? connectionId = null,
-        VibeNetTransport? transport = null,
-        Exception? exception = null)
-    {
-        failureQueue.TryEnqueue(
-            new VibeNetFailure(
-                connectionId,
-                transport,
-                code,
-                operation,
-                message,
-                exception,
-                DateTime.UtcNow));
-    }
-
-    protected void ReportReceiveException(
-        VibeNetOperation operation,
-        string message,
-        Exception exception,
-        Guid? connectionId,
-        VibeNetTransport transport)
-    {
-        ReportFailure(
-            ClassifyReceiveException(exception),
-            operation,
-            message,
-            connectionId,
-            transport,
-            exception);
-    }
-
-    protected static VibeNetFailureCode ClassifyReceiveException(Exception exception)
-    {
-        if (exception is SocketException)
-            return VibeNetFailureCode.SocketError;
-
-        if (exception is IOException)
-            return VibeNetFailureCode.ReceiveFailure;
-
-        return VibeNetFailureCode.InternalError;
-    }
-
-    protected static bool IsControlSendException(Exception exception)
-    {
-        return exception is OperationCanceledException ||
-               exception is IOException ||
-               exception is SocketException ||
-               exception is ObjectDisposedException;
-    }
-
-    protected void ValidatePayload(byte[] data, VibeNetTransport transport)
-    {
-        if (data == null)
-            throw new ArgumentNullException(nameof(data));
-
-        int maximum = transport switch
-        {
-            VibeNetTransport.TCP => Configuration.MaxTCPPayloadBytes,
-            VibeNetTransport.UDP => Configuration.MaxUDPPayloadBytes,
-            _ => throw new ArgumentOutOfRangeException(nameof(transport))
-        };
-
-        if (data.Length > maximum)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(data),
-                "Payload exceeds the configured maximum for " + transport + ".");
-        }
-    }
-
-    protected static void ValidatePort(int port, string parameterName)
-    {
-        if (port < 1 || port > 65535)
-            throw new ArgumentOutOfRangeException(parameterName);
-    }
-}
-
-public sealed class VibeNetServer : VibeNetNode
-{
-    private sealed class ServerSession
-    {
-        public Guid Id { get; }
-        public byte[] Token { get; }
-        public TcpClient TcpClient { get; }
-        public NetworkStream TcpStream { get; }
-        public SemaphoreSlim SendLock { get; }
-        public CancellationTokenSource HandshakeLifetime { get; }
-        public DateTime TcpConnectedAtUtc { get; }
-
-        public IPEndPoint? TcpRemoteEndPoint { get; set; }
-        public IPEndPoint? UdpRemoteEndPoint { get; set; }
-        public VibeNetConnectionState State { get; set; }
-        public DateTime? ConnectedAtUtc { get; set; }
-        public Task SessionTask { get; set; }
-        public long LastTcpActivityStamp;
-        public long LastActivityUtcTicks;
-        public int DisconnectStarted;
-
-        public ServerSession(
-            Guid id,
-            byte[] token,
-            TcpClient tcpClient,
-            IPEndPoint? tcpRemoteEndPoint,
-            CancellationTokenSource handshakeLifetime)
-        {
-            Id = id;
-            Token = token;
-            TcpClient = tcpClient;
-            TcpStream = tcpClient.GetStream();
-            SendLock = new SemaphoreSlim(1, 1);
-            HandshakeLifetime = handshakeLifetime;
-            TcpConnectedAtUtc = DateTime.UtcNow;
-            TcpRemoteEndPoint = tcpRemoteEndPoint;
-            State = VibeNetConnectionState.Connecting;
-            SessionTask = Task.CompletedTask;
-            LastTcpActivityStamp = VibeNetTime.Timestamp;
-            LastActivityUtcTicks = TcpConnectedAtUtc.Ticks;
-        }
-    }
-
-    private readonly object stateLock = new object();
-    private readonly object sessionsLock = new object();
-
-    private readonly BoundedQueue<VibeNetConnectionInfo> connectedQueue;
-    private readonly BoundedQueue<VibeNetDisconnectInfo> disconnectedQueue;
-    private readonly ServerMessageQueue messageQueue;
-    private readonly SemaphoreSlim udpSendLock = new SemaphoreSlim(1, 1);
-
-    private readonly Dictionary<Guid, ServerSession> sessions =
-        new Dictionary<Guid, ServerSession>();
-
-    private readonly Dictionary<string, Guid> udpEndpoints =
-        new Dictionary<string, Guid>(StringComparer.Ordinal);
-
-    private TcpListener? tcpListener;
-    private UdpClient? udpSocket;
-    private Task acceptTask = Task.CompletedTask;
-    private Task udpTask = Task.CompletedTask;
-    private Task heartbeatTask = Task.CompletedTask;
-    private Task? stopTask;
-
-    private bool startAttempted;
-    private bool running;
-    private bool disposed;
-
-    public int MaxClients { get; }
-    public IPAddress BindAddress { get; }
-
-    public bool IsRunning
-    {
-        get
-        {
-            lock (stateLock)
-                return running && !disposed;
-        }
-    }
-
-    public int ConnectedClientCount
-    {
-        get
-        {
-            lock (sessionsLock)
-                return sessions.Values.Count(session => session.State == VibeNetConnectionState.Connected);
-        }
-    }
-
-    public int PendingClientCount
-    {
-        get
-        {
-            lock (sessionsLock)
-                return sessions.Values.Count(session => session.State == VibeNetConnectionState.Connecting);
-        }
-    }
-
-    public IReadOnlyList<VibeNetConnectionInfo> Connections
-    {
-        get
-        {
-            lock (sessionsLock)
-                return sessions.Values.Select(MakeConnectionInfo).ToArray();
-        }
-    }
-
-    public VibeNetServer(
-        int tcpPort = 7777,
-        int? udpPort = null,
-        int maxClients = 32,
-        IPAddress? bindAddress = null,
-        VibeNetConfiguration? configuration = null)
-        : base(tcpPort, udpPort, configuration)
-    {
-        if (maxClients <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maxClients));
-
-        MaxClients = maxClients;
-        BindAddress = ResolveBindAddress(bindAddress, Configuration.AddressMode);
-        connectedQueue =
-            new BoundedQueue<VibeNetConnectionInfo>(
-                Configuration.MaxQueuedEvents,
-                BoundedQueueOverflowMode.DropOldest);
-        disconnectedQueue =
-            new BoundedQueue<VibeNetDisconnectInfo>(
-                Configuration.MaxQueuedEvents,
-                BoundedQueueOverflowMode.DropOldest);
-        messageQueue =
-            new ServerMessageQueue(Configuration.MaxQueuedMessages, maxClients);
-    }
-
-    public override bool TryDequeueMessage(out VibeNetMessage message)
-    {
-        return messageQueue.TryDequeue(out message);
-    }
-
-    public bool TryDequeueConnected(out VibeNetConnectionInfo connection)
-    {
-        return connectedQueue.TryDequeue(out connection);
-    }
-
-    public bool TryDequeueDisconnected(out VibeNetDisconnectInfo disconnect)
-    {
-        return disconnectedQueue.TryDequeue(out disconnect);
-    }
-
-    public bool TryGetConnection(Guid connectionId, out VibeNetConnectionInfo connection)
-    {
-        lock (sessionsLock)
-        {
-            if (sessions.TryGetValue(connectionId, out ServerSession? session))
-            {
-                connection = MakeConnectionInfo(session);
-                return true;
-            }
-        }
-
-        connection = default;
-        return false;
-    }
-
-    public override Task<VibeNetConnectResult> StartAsync(
-        CancellationToken cancellationToken = default)
-    {
-        lock (stateLock)
-        {
-            if (disposed)
-                throw new ObjectDisposedException(nameof(VibeNetServer));
-
-            if (startAttempted)
-                throw new InvalidOperationException("Server instances are single-use.");
-
-            startAttempted = true;
-        }
-
-        cancellationToken.ThrowIfCancellationRequested();
-
-        try
-        {
-            tcpListener = new TcpListener(BindAddress, TCPPort);
-            if (Configuration.AddressMode == VibeNetAddressMode.DualStack)
-                tcpListener.Server.DualMode = true;
-
-            tcpListener.Start();
-            udpSocket = CreateServerUdpSocket(BindAddress, UDPPort, Configuration.AddressMode);
-
-            acceptTask = RunAcceptLoopAsync();
-            udpTask = RunUdpLoopAsync();
-            heartbeatTask = RunHeartbeatLoopAsync();
-
-            lock (stateLock)
-                running = true;
-
-            return Task.FromResult(VibeNetConnectResult.Succeeded());
-        }
-        catch (SocketException ex)
-        {
-            CloseServerSockets();
-            return Task.FromResult(
-                VibeNetConnectResult.Failed(
-                    new VibeNetFailure(
-                        null,
-                        null,
-                        VibeNetFailureCode.SocketError,
-                        VibeNetOperation.Start,
-                        ex.Message,
-                        ex,
-                        DateTime.UtcNow)));
-        }
-        catch
-        {
-            CloseServerSockets();
-            throw;
-        }
-    }
-
-    public async Task<bool> SendAsync(
-        Guid connectionId,
-        byte[] data,
-        VibeNetTransport transport,
-        CancellationToken cancellationToken = default)
-    {
-        ValidatePayload(data, transport);
-
-        ServerSession? session = GetConnectedSession(connectionId);
-        if (session == null)
-            return false;
-
-        if (transport == VibeNetTransport.TCP)
-        {
-            try
-            {
-                await SendTcpFrameAsync(
-                    session,
-                    VibeNetPacketType.Data,
-                    data,
-                    cancellationToken).ConfigureAwait(false);
-
-                return true;
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                ReportFailure(
-                    VibeNetFailureCode.SendFailure,
-                    VibeNetOperation.TcpSend,
-                    "TCP send failed.",
-                    session.Id,
-                    VibeNetTransport.TCP,
-                    ex);
-
-                await DisconnectSessionAsync(
-                    session,
-                    VibeNetDisconnectReason.ConnectionLost,
-                    "TCP send failed.",
-                    false,
-                    CancellationToken.None).ConfigureAwait(false);
-
-                return false;
-            }
-        }
-
-        IPEndPoint? endpoint;
-        lock (sessionsLock)
-            endpoint = session.UdpRemoteEndPoint;
-
-        if (endpoint == null)
-            return false;
-
-        try
-        {
-            await SendUdpFrameAsync(
-                VibeNetPacketType.Data,
-                data,
-                endpoint,
-                cancellationToken).ConfigureAwait(false);
-
-            return true;
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            ReportFailure(
-                VibeNetFailureCode.SendFailure,
-                VibeNetOperation.UdpSend,
-                "UDP send failed.",
-                session.Id,
-                VibeNetTransport.UDP,
-                ex);
-
-            return false;
-        }
-    }
-
-    public async Task<int> BroadcastAsync(
-        byte[] data,
-        VibeNetTransport transport,
-        CancellationToken cancellationToken = default)
-    {
-        ValidatePayload(data, transport);
-
-        Guid[] targets = SnapshotConnectedSessions().Select(session => session.Id).ToArray();
-
-        if (transport == VibeNetTransport.TCP)
-        {
-            Task<bool>[] sends = targets
-                .Select(id => SendAsync(id, data, VibeNetTransport.TCP, cancellationToken))
-                .ToArray();
-
-            bool[] results = await Task.WhenAll(sends).ConfigureAwait(false);
-            return results.Count(result => result);
-        }
-
-        int successCount = 0;
-        foreach (Guid id in targets)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (await SendAsync(id, data, VibeNetTransport.UDP, cancellationToken).ConfigureAwait(false))
-                successCount++;
-        }
-
-        return successCount;
-    }
-
-    public async Task<bool> DisconnectClientAsync(
-        Guid connectionId,
-        CancellationToken cancellationToken = default)
-    {
-        ServerSession? session;
-        lock (sessionsLock)
-            sessions.TryGetValue(connectionId, out session);
-
-        if (session == null)
-            return false;
-
-        bool notifyRemote = session.State == VibeNetConnectionState.Connected;
-        await DisconnectSessionAsync(
-            session,
-            VibeNetDisconnectReason.LocalRequested,
-            "Disconnected by server.",
-            notifyRemote,
-            cancellationToken).ConfigureAwait(false);
-
-        return true;
-    }
-
-    public async Task StopAsync(CancellationToken cancellationToken = default)
-    {
-        Task task;
-
-        lock (stateLock)
-        {
-            if (disposed)
-                return;
-
-            if (!startAttempted)
-                return;
-
-            stopTask ??= StopCoreAsync();
-            task = stopTask;
-        }
-
-        await VibeNetTask.WaitAsync(task, cancellationToken).ConfigureAwait(false);
-    }
-
-    public override void Dispose()
-    {
-        lock (stateLock)
-        {
-            if (disposed)
-                return;
-
-            disposed = true;
-            running = false;
-        }
-
-        Lifetime.Cancel();
-        CloseServerSockets();
-
-        ServerSession[] snapshot = SnapshotSessions();
-        foreach (ServerSession session in snapshot)
-            DisconnectSessionImmediate(session, VibeNetDisconnectReason.ServerStopped, "Server disposed.");
-    }
-
-    private async Task StopCoreAsync()
-    {
-        lock (stateLock)
-            running = false;
-
-        try
-        {
-            tcpListener?.Stop();
-        }
-        catch
-        {
-        }
-
-        ServerSession[] snapshot = SnapshotSessions();
-        using CancellationTokenSource notifyTimeout =
-            VibeNetCancellation.CreateTimeoutSource(VibeNetDefaults.ControlFrameTimeout);
-
-        Task[] disconnects = snapshot
-            .Select(session => DisconnectSessionAsync(
-                session,
-                VibeNetDisconnectReason.ServerStopped,
-                "Server stopped.",
-                session.State == VibeNetConnectionState.Connected,
-                notifyTimeout.Token))
-            .ToArray();
-
-        try
-        {
-            await Task.WhenAll(disconnects).ConfigureAwait(false);
-        }
-        finally
-        {
-            Lifetime.Cancel();
-            try
-            {
-                udpSocket?.Close();
-            }
-            catch
-            {
-            }
-
-            await AwaitBackgroundTasksAsync().ConfigureAwait(false);
-        }
-    }
-
-    private async Task RunAcceptLoopAsync()
-    {
-        if (tcpListener == null)
-            return;
-
-        try
-        {
-            while (!Lifetime.IsCancellationRequested)
-            {
-                TcpClient tcp =
-                    await VibeNetSocket.AcceptTcpClientAsync(tcpListener, Lifetime.Token).ConfigureAwait(false);
-
-                if (!TryReserveClientSlot())
-                {
-                    _ = RejectClientAsync(tcp, "Server capacity reached.");
-                    continue;
-                }
-
-                ServerSession session = CreateSession(tcp);
-
-                lock (sessionsLock)
-                    sessions.Add(session.Id, session);
-
-                session.SessionTask = RunSessionAsync(session);
-            }
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (ObjectDisposedException)
-        {
-        }
-        catch (SocketException ex)
-        {
-            if (!Lifetime.IsCancellationRequested)
-                FailServer(
-                    ex,
-                    VibeNetTransport.TCP,
-                    VibeNetFailureCode.SocketError,
-                    VibeNetOperation.Accept,
-                    "TCP accept loop failed.");
-        }
-        catch (Exception ex)
-        {
-            if (!Lifetime.IsCancellationRequested)
-                FailServer(
-                    ex,
-                    VibeNetTransport.TCP,
-                    VibeNetFailureCode.InternalError,
-                    VibeNetOperation.Accept,
-                    "Unexpected TCP accept-loop failure.");
-        }
-    }
-
-    private async Task RejectClientAsync(TcpClient tcp, string reason)
-    {
-        using CancellationTokenSource timeout = VibeNetCancellation.CreateTimeoutSource(VibeNetDefaults.ControlFrameTimeout);
-
-        try
-        {
-            await VibeNetProtocol.WriteTcpFrameAsync(
-                tcp.GetStream(),
-                VibeNetPacketType.Reject,
-                VibeNetProtocol.CreateRejectPayload(reason),
-                timeout.Token).ConfigureAwait(false);
-        }
-        catch
-        {
-        }
-        finally
+        public int MaxClients
         {
-            try
-            {
-                tcp.Close();
-            }
-            catch
-            {
-            }
+            get;
         }
-    }
-
-    private async Task RunSessionAsync(ServerSession session)
-    {
-        VibeNetDisconnectReason finalReason = VibeNetDisconnectReason.ConnectionLost;
-        string finalDetail = "TCP connection closed.";
-
-        try
-        {
-            await SendTcpFrameAsync(
-                session,
-                VibeNetPacketType.Hello,
-                VibeNetProtocol.CreateHelloPayload(session.Id, session.Token),
-                session.HandshakeLifetime.Token).ConfigureAwait(false);
-
-            while (!Lifetime.IsCancellationRequested)
-            {
-                CancellationToken readToken =
-                    session.State == VibeNetConnectionState.Connecting
-                    ? session.HandshakeLifetime.Token
-                    : Lifetime.Token;
-
-                NetworkFrame? frame = await VibeNetProtocol.ReadTcpFrameAsync(
-                    session.TcpStream,
-                    Math.Max(Configuration.MaxTCPPayloadBytes, VibeNetProtocol.MaxControlPayloadBytes),
-                    readToken).ConfigureAwait(false);
-
-                if (frame == null)
-                {
-                    finalDetail =
-                        session.State == VibeNetConnectionState.Connecting
-                        ? "Connection closed during handshake."
-                        : "TCP connection closed.";
-                    break;
-                }
-
-                TouchTcp(session);
-
-                if (session.State == VibeNetConnectionState.Connecting)
-                    await HandleConnectingFrameAsync(session, frame).ConfigureAwait(false);
-                else
-                    await HandleConnectedFrameAsync(session, frame).ConfigureAwait(false);
-            }
-        }
-        catch (VibeNetDisconnectSignal signal)
+        public int MaxPendingHandshakes
         {
-            finalReason = signal.Reason;
-            finalDetail = signal.Detail;
+            get;
         }
-        catch (OperationCanceledException) when (
-            session.State == VibeNetConnectionState.Connecting &&
-            session.HandshakeLifetime.IsCancellationRequested &&
-            !Lifetime.IsCancellationRequested)
+        public int MaxTcpPayloadBytes
         {
-            finalReason = VibeNetDisconnectReason.Timeout;
-            finalDetail = "Connection handshake timed out.";
+            get;
         }
-        catch (OperationCanceledException) when (Lifetime.IsCancellationRequested)
+        public int MaxUdpPayloadBytes
         {
-            finalReason = VibeNetDisconnectReason.ServerStopped;
-            finalDetail = "Server stopped.";
+            get;
         }
-        catch (VibeNetProtocolException ex)
+        public int MaxQueuedMessages
         {
-            ReportFailure(
-                VibeNetFailureCode.ProtocolError,
-                session.State == VibeNetConnectionState.Connecting
-                    ? VibeNetOperation.ReadyHandshake
-                    : VibeNetOperation.TcpReceive,
-                ex.Message,
-                session.Id,
-                VibeNetTransport.TCP,
-                ex);
-
-            finalReason = VibeNetDisconnectReason.ProtocolError;
-            finalDetail = ex.Message;
+            get;
         }
-        catch (Exception ex)
+        public int MaxMessagesPerConnection
         {
-            if (Volatile.Read(ref session.DisconnectStarted) == 0)
-            {
-                ReportReceiveException(
-                    session.State == VibeNetConnectionState.Connecting
-                        ? VibeNetOperation.ReadyHandshake
-                        : VibeNetOperation.TcpReceive,
-                    "TCP receive failed.",
-                    ex,
-                    session.Id,
-                    VibeNetTransport.TCP);
-            }
+            get;
         }
-        finally
+        public long MaxQueuedBytes
         {
-            await DisconnectSessionAsync(
-                session,
-                finalReason,
-                finalDetail,
-                false,
-                CancellationToken.None).ConfigureAwait(false);
+            get;
         }
-    }
-
-    private async Task HandleConnectingFrameAsync(ServerSession session, NetworkFrame frame)
-    {
-        if (frame.Type != VibeNetPacketType.Ready)
-            throw new VibeNetProtocolException("Unexpected TCP packet during handshake: " + frame.Type + ".");
-
-        VibeNetProtocol.RequireEmptyPayload(frame);
-
-        bool hasUdp;
-        lock (sessionsLock)
-            hasUdp = session.UdpRemoteEndPoint != null;
-
-        if (!hasUdp)
-            throw new VibeNetProtocolException("READY received before UDP registration completed.");
-
-        await SendTcpFrameAsync(
-            session,
-            VibeNetPacketType.ReadyAck,
-            VibeNetProtocol.EmptyPayload,
-            session.HandshakeLifetime.Token).ConfigureAwait(false);
-
-        VibeNetConnectionInfo connectionInfo;
-        lock (sessionsLock)
+        public long MaxBufferedBytes
         {
-            if (!sessions.ContainsKey(session.Id) ||
-                Volatile.Read(ref session.DisconnectStarted) != 0)
-            {
-                throw new VibeNetDisconnectSignal(
-                    VibeNetDisconnectReason.ConnectionLost,
-                    "Session closed during handshake.");
-            }
-
-            session.State = VibeNetConnectionState.Connected;
-            session.ConnectedAtUtc = DateTime.UtcNow;
-            connectionInfo = MakeConnectionInfo(session);
+            get;
         }
-
-        connectedQueue.TryEnqueue(connectionInfo);
-    }
-
-    private Task HandleConnectedFrameAsync(ServerSession session, NetworkFrame frame)
-    {
-        switch (frame.Type)
+        public long MaxBufferedBytesPerConnection
         {
-            case VibeNetPacketType.Pong:
-                VibeNetProtocol.RequireEmptyPayload(frame);
-                return Task.CompletedTask;
-
-            case VibeNetPacketType.Data:
-                if (frame.Payload.Length > Configuration.MaxTCPPayloadBytes)
-                    throw new VibeNetProtocolException("TCP payload exceeds configured maximum.");
-
-                VibeNetMessage tcpMessage =
-                    new VibeNetMessage(session.Id, VibeNetTransport.TCP, frame.Payload);
-
-                ServerQueueEnqueueResult enqueueResult = messageQueue.Enqueue(
-                    session.Id,
-                    tcpMessage,
-                    true);
-
-                if (enqueueResult.Kind == ServerQueueEnqueueKind.DisconnectCurrent)
-                {
-                    ReportFailure(
-                        VibeNetFailureCode.QueueOverflow,
-                        VibeNetOperation.TcpReceive,
-                        "Reliable message queue limit exceeded.",
-                        session.Id,
-                        VibeNetTransport.TCP);
-
-                    throw new VibeNetDisconnectSignal(
-                        VibeNetDisconnectReason.ResourceLimit,
-                        "Reliable message queue limit exceeded.");
-                }
-
-                return Task.CompletedTask;
-
-            case VibeNetPacketType.Disconnect:
-                VibeNetDisconnectCode code = VibeNetProtocol.ParseDisconnectPayload(frame.Payload);
-                if (code != VibeNetDisconnectCode.ClientRequested)
-                    throw new VibeNetProtocolException("Client sent an invalid disconnect code.");
-
-                throw new VibeNetDisconnectSignal(
-                    VibeNetDisconnectReason.RemoteRequested,
-                    "Remote client requested disconnection.");
-
-            default:
-                throw new VibeNetProtocolException("Unexpected TCP packet from client: " + frame.Type + ".");
+            get;
         }
-    }
-
-    private async Task RunUdpLoopAsync()
-    {
-        if (udpSocket == null)
-            return;
-
-        try
+        public int MaxPendingSends
         {
-            while (!Lifetime.IsCancellationRequested)
-            {
-                UdpReceiveResult result =
-                    await VibeNetSocket.ReceiveAsync(udpSocket, Lifetime.Token).ConfigureAwait(false);
-
-                if (!VibeNetProtocol.TryParseUdpFrame(
-                    result.Buffer,
-                    Math.Max(Configuration.MaxUDPPayloadBytes, VibeNetProtocol.MaxControlPayloadBytes),
-                    out NetworkFrame? frame))
-                {
-                    continue;
-                }
-
-                if (frame != null && frame.Type == VibeNetPacketType.UdpRegister)
-                {
-                    ProcessUdpRegistration(frame.Payload, result.RemoteEndPoint);
-                    continue;
-                }
-
-                if (frame == null || frame.Type != VibeNetPacketType.Data)
-                    continue;
-
-                ServerSession? session = FindSessionByUdpEndPoint(result.RemoteEndPoint);
-                if (session == null || session.State != VibeNetConnectionState.Connected)
-                    continue;
-
-                TouchActivity(session);
-
-                if (frame.Payload.Length > Configuration.MaxUDPPayloadBytes)
-                {
-                    ReportFailure(
-                        VibeNetFailureCode.ProtocolError,
-                        VibeNetOperation.UdpReceive,
-                        "UDP payload exceeds configured maximum.",
-                        session.Id,
-                        VibeNetTransport.UDP);
-                    continue;
-                }
-
-                VibeNetMessage udpMessage =
-                    new VibeNetMessage(session.Id, VibeNetTransport.UDP, frame.Payload);
-
-                ServerQueueEnqueueResult enqueueResult = messageQueue.Enqueue(
-                    session.Id,
-                    udpMessage,
-                    false);
-
-                if (enqueueResult.Kind != ServerQueueEnqueueKind.Enqueued)
-                {
-                    ReportFailure(
-                        VibeNetFailureCode.QueueOverflow,
-                        VibeNetOperation.UdpReceive,
-                        "Incoming UDP datagram dropped because the queue is full.",
-                        session.Id,
-                        VibeNetTransport.UDP);
-                }
-
-            }
+            get;
         }
-        catch (OperationCanceledException)
+        public int MaxPendingSendsPerConnection
         {
+            get;
         }
-        catch (ObjectDisposedException)
+        public int MaxEvents
         {
+            get;
         }
-        catch (Exception ex)
+        public int MaxPacketsPerSecond
         {
-            if (!Lifetime.IsCancellationRequested)
-                FailServer(
-                    ex,
-                    VibeNetTransport.UDP,
-                    ClassifyReceiveException(ex),
-                    VibeNetOperation.UdpReceive,
-                    "UDP receive loop failed.");
+            get;
         }
-    }
-
-    private void ProcessUdpRegistration(byte[] payload, IPEndPoint remoteEndPoint)
-    {
-        if (!VibeNetProtocol.TryParseRegistrationPayload(payload, out Guid id, out byte[]? token))
-            return;
-
-        ServerSession? session = null;
-        string endpointKey = CreateEndpointKey(remoteEndPoint);
-
-        lock (sessionsLock)
+        public int MaxPacketsPerSecondPerConnection
         {
-            if (udpEndpoints.TryGetValue(endpointKey, out Guid existingId) && existingId != id)
-                return;
-
-            if (!sessions.TryGetValue(id, out ServerSession? candidate))
-                return;
-
-            if (token == null ||
-                candidate.State != VibeNetConnectionState.Connecting ||
-                Volatile.Read(ref candidate.DisconnectStarted) != 0 ||
-                !FixedTimeEquals(candidate.Token, token))
-            {
-                return;
-            }
-
-            if (candidate.UdpRemoteEndPoint != null)
-                udpEndpoints.Remove(CreateEndpointKey(candidate.UdpRemoteEndPoint));
-
-            candidate.UdpRemoteEndPoint = remoteEndPoint;
-            udpEndpoints[endpointKey] = candidate.Id;
-            TouchActivity(candidate);
-            session = candidate;
+            get;
         }
-
-        if (session == null)
-            return;
-
-        _ = AcknowledgeUdpRegistrationAsync(session, remoteEndPoint);
-    }
-
-    private async Task AcknowledgeUdpRegistrationAsync(ServerSession session, IPEndPoint remoteEndPoint)
-    {
-        using CancellationTokenSource timeout = VibeNetCancellation.CreateTimeoutSource(VibeNetDefaults.ControlFrameTimeout);
-
-        try
+        public long MaxBytesPerSecond
         {
-            await SendUdpFrameAsync(
-                VibeNetPacketType.UdpAck,
-                VibeNetProtocol.GuidToNetworkBytes(session.Id),
-                remoteEndPoint,
-                timeout.Token).ConfigureAwait(false);
+            get;
         }
-        catch (Exception ex) when (
-            ex is OperationCanceledException ||
-            ex is SocketException ||
-            ex is ObjectDisposedException)
+        public int MaxConnectionAttemptsPerSecond
         {
-            ReportFailure(
-                VibeNetFailureCode.SendFailure,
-                VibeNetOperation.UdpHandshake,
-                "Failed to acknowledge UDP registration.",
-                session.Id,
-                VibeNetTransport.UDP,
-                ex);
+            get;
         }
-    }
-
-    private async Task RunHeartbeatLoopAsync()
-    {
-        try
+        public int MaxAttemptsPerAddressPerSecond
         {
-            while (!Lifetime.IsCancellationRequested)
-            {
-                await Task.Delay(Configuration.TCPHeartbeatInterval, Lifetime.Token).ConfigureAwait(false);
-
-                foreach (ServerSession session in SnapshotConnectedSessions())
-                {
-                    if (VibeNetTime.HasElapsed(
-                        Interlocked.Read(ref session.LastTcpActivityStamp),
-                        Configuration.TCPHeartbeatTimeout))
-                    {
-                        _ = DisconnectSessionAsync(
-                            session,
-                            VibeNetDisconnectReason.Timeout,
-                            "TCP heartbeat timed out.",
-                            false,
-                            CancellationToken.None);
-                        continue;
-                    }
-
-                    _ = SendHeartbeatAsync(session);
-                }
-            }
+            get;
         }
-        catch (OperationCanceledException)
+        public int MaxTrackedAddresses
         {
+            get;
         }
-        catch (Exception ex)
+        public VibeNetLimits(int maxClients = 10000, int maxPendingHandshakes = 8,
+            int maxTcpPayloadBytes = 1048576, int maxUdpPayloadBytes = 1024,
+            int maxQueuedMessages = 8192, int maxMessagesPerConnection = 256,
+            long maxQueuedBytes = 67108864, long maxBufferedBytes = 134217728,
+            long maxBufferedBytesPerConnection = 8388608, int maxPendingSends = 1024,
+            int maxPendingSendsPerConnection = 64, int maxEvents = 2048,
+            int maxPacketsPerSecond = 250000, int maxPacketsPerSecondPerConnection = 1000,
+            long maxBytesPerSecond = 134217728, int maxConnectionAttemptsPerSecond = 64,
+            int maxAttemptsPerAddressPerSecond = 16, int maxTrackedAddresses = 4096)
         {
-            if (!Lifetime.IsCancellationRequested)
-                FailServer(
-                    ex,
-                    VibeNetTransport.TCP,
-                    VibeNetFailureCode.InternalError,
-                    VibeNetOperation.Heartbeat,
-                    "Heartbeat loop failed.");
+            MaxClients = Positive(maxClients);
+            MaxPendingHandshakes = Positive(maxPendingHandshakes);
+            MaxTcpPayloadBytes = Positive(maxTcpPayloadBytes);
+            MaxUdpPayloadBytes = Positive(maxUdpPayloadBytes);
+            if (maxTcpPayloadBytes > 16777216 || maxUdpPayloadBytes > 65407)
+                throw new ArgumentOutOfRangeException("payload size");
+            MaxQueuedMessages = Positive(maxQueuedMessages);
+            MaxMessagesPerConnection = Positive(maxMessagesPerConnection);
+            MaxQueuedBytes = Positive(maxQueuedBytes);
+            MaxBufferedBytes = Positive(maxBufferedBytes);
+            MaxBufferedBytesPerConnection = Positive(maxBufferedBytesPerConnection);
+            if (maxQueuedBytes > maxBufferedBytes || maxBufferedBytesPerConnection > maxBufferedBytes)
+                throw new ArgumentException("Inconsistent byte budgets.");
+            MaxPendingSends = Positive(maxPendingSends);
+            MaxPendingSendsPerConnection = Positive(maxPendingSendsPerConnection);
+            MaxEvents = Positive(maxEvents);
+            MaxPacketsPerSecond = Positive(maxPacketsPerSecond);
+            MaxPacketsPerSecondPerConnection = Positive(maxPacketsPerSecondPerConnection);
+            MaxBytesPerSecond = Positive(maxBytesPerSecond);
+            MaxConnectionAttemptsPerSecond = Positive(maxConnectionAttemptsPerSecond);
+            MaxAttemptsPerAddressPerSecond = Positive(maxAttemptsPerAddressPerSecond);
+            MaxTrackedAddresses = Positive(maxTrackedAddresses);
         }
+        private static int Positive(int n) => n > 0 ? n : throw new ArgumentOutOfRangeException(nameof(n));
+        private static long Positive(long n) => n > 0 ? n : throw new ArgumentOutOfRangeException(nameof(n));
     }
-
-    private async Task SendHeartbeatAsync(ServerSession session)
+    public sealed class VibeNetConfiguration
     {
-        using CancellationTokenSource timeout = VibeNetCancellation.CreateTimeoutSource(Configuration.TCPHeartbeatInterval);
-
-        try
+        public VibeNetLimits Limits
         {
-            await SendTcpFrameAsync(
-                session,
-                VibeNetPacketType.Ping,
-                VibeNetProtocol.EmptyPayload,
-                timeout.Token).ConfigureAwait(false);
+            get;
         }
-        catch (Exception ex) when (
-            ex is OperationCanceledException ||
-            ex is IOException ||
-            ex is SocketException ||
-            ex is ObjectDisposedException)
+        public TimeSpan ConnectTimeout
         {
-            ReportFailure(
-                VibeNetFailureCode.SendFailure,
-                VibeNetOperation.Heartbeat,
-                "Heartbeat send failed.",
-                session.Id,
-                VibeNetTransport.TCP,
-                ex);
-
-            await DisconnectSessionAsync(
-                session,
-                VibeNetDisconnectReason.ConnectionLost,
-                "Heartbeat send failed.",
-                false,
-                CancellationToken.None).ConfigureAwait(false);
+            get;
         }
-    }
-
-    private async Task SendTcpFrameAsync(
-        ServerSession session,
-        VibeNetPacketType type,
-        byte[] payload,
-        CancellationToken cancellationToken)
-    {
-        await session.SendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
+        public TimeSpan HeartbeatInterval
         {
-            if (session.State == VibeNetConnectionState.Disconnecting ||
-                session.State == VibeNetConnectionState.Disconnected ||
-                session.State == VibeNetConnectionState.Faulted)
-            {
-                throw new ObjectDisposedException(nameof(ServerSession));
-            }
-
-            await VibeNetProtocol.WriteTcpFrameAsync(
-                session.TcpStream,
-                type,
-                payload,
-                cancellationToken).ConfigureAwait(false);
+            get;
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        public TimeSpan IdleTimeout
         {
-            try
-            {
-                session.TcpClient.Close();
-            }
-            catch
-            {
-            }
-
-            throw;
+            get;
         }
-        finally
+        public TimeSpan SendTimeout
         {
-            session.SendLock.Release();
+            get;
         }
-    }
-
-    private async Task SendUdpFrameAsync(
-        VibeNetPacketType type,
-        byte[] payload,
-        IPEndPoint endpoint,
-        CancellationToken cancellationToken)
-    {
-        if (udpSocket == null)
-            throw new ObjectDisposedException(nameof(VibeNetServer));
-
-        byte[] datagram = VibeNetProtocol.CreateUdpFrame(type, payload);
-
-        await udpSendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
+        public TimeSpan UdpRetryInterval
         {
-            await VibeNetSocket.SendAsync(udpSocket, datagram, endpoint, cancellationToken)
-                .ConfigureAwait(false);
+            get;
         }
-        finally
+        public VibeNetConfiguration(VibeNetLimits? limits = null, TimeSpan? connectTimeout = null,
+            TimeSpan? heartbeatInterval = null, TimeSpan? idleTimeout = null,
+            TimeSpan? sendTimeout = null, TimeSpan? udpRetryInterval = null)
         {
-            udpSendLock.Release();
+            Limits = limits ?? new VibeNetLimits();
+            ConnectTimeout = Duration(connectTimeout ?? TimeSpan.FromSeconds(60));
+            HeartbeatInterval = Duration(heartbeatInterval ?? TimeSpan.FromSeconds(2));
+            IdleTimeout = Duration(idleTimeout ?? TimeSpan.FromSeconds(15));
+            SendTimeout = Duration(sendTimeout ?? TimeSpan.FromSeconds(5));
+            UdpRetryInterval = Duration(udpRetryInterval ?? TimeSpan.FromMilliseconds(250));
+            if (IdleTimeout <= HeartbeatInterval)
+                throw new ArgumentException("IdleTimeout must exceed HeartbeatInterval.");
         }
+        private static TimeSpan Duration(TimeSpan t) => t.TotalMilliseconds >= 1 && t.TotalMilliseconds <= int.MaxValue - 1 ? t : throw new ArgumentOutOfRangeException(nameof(t));
+        internal int MaxClients => Limits.MaxClients;
+        internal int MaxPendingHandshakes => Limits.MaxPendingHandshakes;
+        internal int MaxTcpPayloadBytes => Limits.MaxTcpPayloadBytes;
+        internal int MaxUdpPayloadBytes => Limits.MaxUdpPayloadBytes;
+        internal int MaxQueuedMessages => Limits.MaxQueuedMessages;
+        internal int MaxMessagesPerConnection => Limits.MaxMessagesPerConnection;
+        internal long MaxQueuedBytes => Limits.MaxQueuedBytes;
+        internal long MaxBufferedBytes => Limits.MaxBufferedBytes;
+        internal long MaxBufferedBytesPerConnection => Limits.MaxBufferedBytesPerConnection;
+        internal int MaxPendingSends => Limits.MaxPendingSends;
+        internal int MaxPendingSendsPerConnection => Limits.MaxPendingSendsPerConnection;
+        internal int MaxEvents => Limits.MaxEvents;
+        internal int MaxPacketsPerSecond => Limits.MaxPacketsPerSecond;
+        internal int MaxPacketsPerSecondPerConnection => Limits.MaxPacketsPerSecondPerConnection;
+        internal long MaxBytesPerSecond => Limits.MaxBytesPerSecond;
+        internal int MaxConnectionAttemptsPerSecond => Limits.MaxConnectionAttemptsPerSecond;
+        internal int MaxAttemptsPerAddressPerSecond => Limits.MaxAttemptsPerAddressPerSecond;
+        internal int MaxTrackedAddresses => Limits.MaxTrackedAddresses;
     }
-
-    private async Task DisconnectSessionAsync(
-        ServerSession session,
-        VibeNetDisconnectReason reason,
-        string detail,
-        bool notifyRemote,
-        CancellationToken cancellationToken)
+    public readonly struct VibeNetMessage
     {
-        if (Interlocked.Exchange(ref session.DisconnectStarted, 1) != 0)
-            return;
-
-        bool publishDisconnect;
-        VibeNetConnectionInfo finalInfo;
-
-        lock (sessionsLock)
+        public Guid ConnectionId
         {
-            publishDisconnect = session.State == VibeNetConnectionState.Connected;
-            session.State = VibeNetConnectionState.Disconnecting;
+            get;
         }
-
-        if (notifyRemote)
+        public VibeNetTransport Transport
         {
-            await TrySendDisconnectControlFrameAsync(session, reason, cancellationToken).ConfigureAwait(false);
+            get;
         }
-
-        session.HandshakeLifetime.Cancel();
-
-        lock (sessionsLock)
+        public byte[] Data
         {
-            if (session.UdpRemoteEndPoint != null)
-                udpEndpoints.Remove(CreateEndpointKey(session.UdpRemoteEndPoint));
-
-            messageQueue.RemoveOwner(session.Id);
-
-            session.State = IsFault(reason)
-                ? VibeNetConnectionState.Faulted
-                : VibeNetConnectionState.Disconnected;
-
-            finalInfo = MakeConnectionInfo(session);
-            sessions.Remove(session.Id);
+            get;
         }
-
-        try
+        internal VibeNetMessage(Guid id, VibeNetTransport transport, byte[] data)
         {
-            session.TcpClient.Close();
+            ConnectionId = id;
+            Transport = transport;
+            Data = data;
         }
-        catch
-        {
-        }
-
-        session.HandshakeLifetime.Dispose();
-        session.SendLock.Dispose();
-
-        if (publishDisconnect)
-            PublishDisconnectEvent(finalInfo, reason, detail);
     }
-
-    private void DisconnectSessionImmediate(
-        ServerSession session,
-        VibeNetDisconnectReason reason,
-        string detail)
+    public readonly struct VibeNetFailure
     {
-        if (Interlocked.Exchange(ref session.DisconnectStarted, 1) != 0)
-            return;
-
-        bool publishDisconnect;
-        VibeNetConnectionInfo finalInfo;
-
-        lock (sessionsLock)
-        {
-            publishDisconnect = session.State == VibeNetConnectionState.Connected;
-
-            if (session.UdpRemoteEndPoint != null)
-                udpEndpoints.Remove(CreateEndpointKey(session.UdpRemoteEndPoint));
-
-            messageQueue.RemoveOwner(session.Id);
-
-            session.State = IsFault(reason)
-                ? VibeNetConnectionState.Faulted
-                : VibeNetConnectionState.Disconnected;
-
-            finalInfo = MakeConnectionInfo(session);
-            sessions.Remove(session.Id);
-        }
-
-        session.HandshakeLifetime.Cancel();
-
-        try
+        public Guid? ConnectionId
         {
-            session.TcpClient.Close();
+            get;
         }
-        catch
+        public FailureCode Code
         {
+            get;
         }
-
-        session.HandshakeLifetime.Dispose();
-        session.SendLock.Dispose();
-
-        if (publishDisconnect)
-            PublishDisconnectEvent(finalInfo, reason, detail);
-    }
-
-    private async Task TrySendDisconnectControlFrameAsync(
-        ServerSession session,
-        VibeNetDisconnectReason reason,
-        CancellationToken cancellationToken)
-    {
-        using CancellationTokenSource timeout = VibeNetCancellation.CreateLinkedTimeoutSource(
-            VibeNetDefaults.ControlFrameTimeout,
-            cancellationToken);
-
-        try
+        public string Detail
         {
-            VibeNetDisconnectCode code =
-                reason == VibeNetDisconnectReason.ServerStopped
-                ? VibeNetDisconnectCode.ServerStopping
-                : VibeNetDisconnectCode.ServerRequested;
-
-            await SendTcpFrameAsync(
-                session,
-                VibeNetPacketType.Disconnect,
-                VibeNetProtocol.CreateDisconnectPayload(code),
-                timeout.Token).ConfigureAwait(false);
+            get;
         }
-        catch (Exception ex) when (IsControlSendException(ex))
+        internal VibeNetFailure(Guid? id, FailureCode code, string detail)
         {
-            ReportFailure(
-                VibeNetFailureCode.SendFailure,
-                VibeNetOperation.Disconnect,
-                "Failed to send disconnect control frame.",
-                session.Id,
-                VibeNetTransport.TCP,
-                ex);
+            ConnectionId = id;
+            Code = code;
+            Detail = detail;
         }
-    }
-
-    private void PublishDisconnectEvent(
-        VibeNetConnectionInfo connection,
-        VibeNetDisconnectReason reason,
-        string detail)
-    {
-        disconnectedQueue.TryEnqueue(
-            new VibeNetDisconnectInfo(
-                connection,
-                reason,
-                detail,
-                DateTime.UtcNow));
-    }
-
-    private void FailServer(
-        Exception exception,
-        VibeNetTransport transport,
-        VibeNetFailureCode code,
-        VibeNetOperation operation,
-        string message)
-    {
-        ReportFailure(code, operation, message, null, transport, exception);
-
-        lock (stateLock)
-            running = false;
-
-        Lifetime.Cancel();
-        CloseServerSockets();
-
-        foreach (ServerSession session in SnapshotSessions())
-            DisconnectSessionImmediate(session, VibeNetDisconnectReason.ConnectionLost, message);
     }
-
-    private async Task AwaitBackgroundTasksAsync()
+    public readonly struct StartResult
     {
-        List<Task> tasks = new List<Task>
+        public bool Success
         {
-            acceptTask,
-            udpTask,
-            heartbeatTask
-        };
-
-        tasks.AddRange(SnapshotSessions().Select(session => session.SessionTask));
-
-        try
-        {
-            await Task.WhenAll(tasks).ConfigureAwait(false);
-        }
-        catch
-        {
+            get;
         }
-    }
-
-    private ServerSession CreateSession(TcpClient tcp)
-    {
-        CancellationTokenSource handshakeLifetime =
-            CancellationTokenSource.CreateLinkedTokenSource(Lifetime.Token);
-        handshakeLifetime.CancelAfter(Configuration.ServerConnectTimeout);
-
-        IPEndPoint? remoteEndPoint = tcp.Client.RemoteEndPoint as IPEndPoint;
-        ServerSession session = new ServerSession(
-            Guid.NewGuid(),
-            CreateSessionToken(),
-            tcp,
-            remoteEndPoint,
-            handshakeLifetime);
-
-        return session;
-    }
-
-    private ServerSession? GetConnectedSession(Guid id)
-    {
-        lock (sessionsLock)
+        public VibeNetFailure? Failure
         {
-            if (sessions.TryGetValue(id, out ServerSession? session) &&
-                session.State == VibeNetConnectionState.Connected &&
-                Volatile.Read(ref session.DisconnectStarted) == 0)
-            {
-                return session;
-            }
+            get;
         }
-
-        return null;
-    }
-
-    private ServerSession? FindSessionByUdpEndPoint(IPEndPoint remoteEndPoint)
-    {
-        string key = CreateEndpointKey(remoteEndPoint);
-
-        lock (sessionsLock)
+        internal StartResult(VibeNetFailure? failure)
         {
-            if (!udpEndpoints.TryGetValue(key, out Guid id))
-                return null;
-
-            sessions.TryGetValue(id, out ServerSession? session);
-            return session;
+            Success = !failure.HasValue;
+            Failure = failure;
         }
-    }
-
-    private ServerSession[] SnapshotSessions()
-    {
-        lock (sessionsLock)
-            return sessions.Values.ToArray();
     }
-
-    private ServerSession[] SnapshotConnectedSessions()
+    public readonly struct ConnectionInfo
     {
-        lock (sessionsLock)
+        public Guid Id
         {
-            return sessions.Values
-                .Where(session =>
-                    session.State == VibeNetConnectionState.Connected &&
-                    Volatile.Read(ref session.DisconnectStarted) == 0)
-                .ToArray();
+            get;
         }
-    }
-
-    private bool TryReserveClientSlot()
-    {
-        lock (sessionsLock)
-            return sessions.Count < MaxClients;
-    }
-
-    private VibeNetConnectionInfo MakeConnectionInfo(ServerSession session)
-    {
-        IPAddress? remoteAddress = session.TcpRemoteEndPoint == null
-            ? null
-            : NormalizeDisplayAddress(session.TcpRemoteEndPoint.Address);
-
-        int tcpRemotePort = session.TcpRemoteEndPoint?.Port ?? 0;
-        int udpRemotePort = session.UdpRemoteEndPoint?.Port ?? 0;
-        DateTime lastActivityUtc =
-            new DateTime(Interlocked.Read(ref session.LastActivityUtcTicks), DateTimeKind.Utc);
-
-        return new VibeNetConnectionInfo(
-            session.Id,
-            remoteAddress,
-            tcpRemotePort,
-            udpRemotePort,
-            session.State,
-            session.TcpConnectedAtUtc,
-            session.ConnectedAtUtc,
-            lastActivityUtc);
-    }
-
-    private static void TouchTcp(ServerSession session)
-    {
-        Interlocked.Exchange(ref session.LastTcpActivityStamp, VibeNetTime.Timestamp);
-        TouchActivity(session);
-    }
-
-    private static void TouchActivity(ServerSession session)
-    {
-        Interlocked.Exchange(ref session.LastActivityUtcTicks, DateTime.UtcNow.Ticks);
-    }
-
-    private void CloseServerSockets()
-    {
-        try
+        public IPEndPoint TcpEndpoint
         {
-            tcpListener?.Stop();
+            get;
         }
-        catch
+        public IPEndPoint? UdpEndpoint
         {
+            get;
         }
-
-        try
+        public ConnectionState State
         {
-            udpSocket?.Close();
+            get;
         }
-        catch
+        internal ConnectionInfo(Link c)
         {
+            Id = c.Id;
+            TcpEndpoint = new IPEndPoint(c.TcpEndpoint.Address, c.TcpEndpoint.Port);
+            var u = c.UdpEndpoint;
+            UdpEndpoint = u == null ? null : new IPEndPoint(u.Address, u.Port);
+            State = c.State;
         }
     }
-
-    private static IPAddress ResolveBindAddress(IPAddress? bindAddress, VibeNetAddressMode addressMode)
+    public readonly struct DisconnectInfo
     {
-        if (bindAddress == null)
+        public Guid ConnectionId
         {
-            return addressMode == VibeNetAddressMode.IPv4
-                ? IPAddress.Any
-                : IPAddress.IPv6Any;
+            get;
         }
-
-        if (addressMode == VibeNetAddressMode.IPv4 &&
-            bindAddress.AddressFamily != AddressFamily.InterNetwork)
+        public DisconnectReason Reason
         {
-            throw new ArgumentException("IPv4 mode requires an IPv4 bind address.", nameof(bindAddress));
+            get;
         }
-
-        if ((addressMode == VibeNetAddressMode.IPv6 ||
-             addressMode == VibeNetAddressMode.DualStack) &&
-            bindAddress.AddressFamily != AddressFamily.InterNetworkV6)
+        internal DisconnectInfo(Guid id, DisconnectReason reason)
         {
-            throw new ArgumentException("IPv6 and DualStack modes require an IPv6 bind address.", nameof(bindAddress));
+            ConnectionId = id;
+            Reason = reason;
         }
-
-        return bindAddress;
     }
-
-    private static UdpClient CreateServerUdpSocket(IPAddress bindAddress, int port, VibeNetAddressMode addressMode)
+    public readonly struct BroadcastResult
     {
-        UdpClient udp = new UdpClient(bindAddress.AddressFamily);
-
-        try
-        {
-            if (addressMode == VibeNetAddressMode.DualStack)
-                udp.Client.DualMode = true;
-
-            udp.Client.Bind(new IPEndPoint(bindAddress, port));
-            return udp;
-        }
-        catch
+        public int Sent
         {
-            udp.Dispose();
-            throw;
+            get;
         }
-    }
-
-    private static byte[] CreateSessionToken()
-    {
-        byte[] token = new byte[VibeNetProtocol.SessionTokenSize];
-        RandomNumberGenerator.Fill(token);
-        return token;
-    }
-
-    private static bool IsFault(VibeNetDisconnectReason reason)
-    {
-        return reason == VibeNetDisconnectReason.Timeout ||
-               reason == VibeNetDisconnectReason.ConnectionLost ||
-               reason == VibeNetDisconnectReason.ProtocolError ||
-               reason == VibeNetDisconnectReason.ResourceLimit;
-    }
-
-    private static bool FixedTimeEquals(byte[] left, byte[] right)
-    {
-        if (left.Length != right.Length)
-            return false;
-
-        return CryptographicOperations.FixedTimeEquals(left, right);
-    }
-
-    private static string CreateEndpointKey(IPEndPoint endPoint)
-    {
-        IPAddress normalized = NormalizeDisplayAddress(endPoint.Address) ?? endPoint.Address;
-        return "[" + normalized + "]:" + endPoint.Port;
-    }
-
-    private static IPAddress? NormalizeDisplayAddress(IPAddress? address)
-    {
-        if (address != null && address.IsIPv4MappedToIPv6)
-            return address.MapToIPv4();
-
-        return address;
-    }
-}
-
-public sealed class VibeNetClient : VibeNetNode
-{
-    private readonly object stateLock = new object();
-    private readonly BoundedQueue<VibeNetMessage> messageQueue;
-    private readonly BoundedQueue<VibeNetDisconnectInfo> disconnectedQueue;
-    private readonly SemaphoreSlim tcpSendLock = new SemaphoreSlim(1, 1);
-    private readonly SemaphoreSlim udpSendLock = new SemaphoreSlim(1, 1);
-
-    private TcpClient? tcpClient;
-    private NetworkStream? tcpStream;
-    private UdpClient? udpSocket;
-
-    private Task tcpTask = Task.CompletedTask;
-    private Task udpTask = Task.CompletedTask;
-    private Task heartbeatTask = Task.CompletedTask;
-    private Task? shutdownTask;
-
-    private bool startAttempted;
-    private bool disposed;
-    private bool shutdownStarted;
-    private bool connectionEstablished;
-
-    private byte[]? sessionToken;
-    private Guid connectionId;
-    private IPAddress? remoteAddress;
-    private IPAddress? connectedRemoteAddress;
-    private DateTime tcpConnectedAtUtc;
-    private DateTime? connectedAtUtc;
-    private long lastActivityUtcTicks;
-    private long lastTcpActivityStamp;
-    private int tcpRemotePort;
-    private int udpRemotePort;
-    private VibeNetConnectionState state = VibeNetConnectionState.Created;
-    private VibeNetDisconnectReason? lastDisconnectReason;
-
-    public string RemoteHost { get; }
-
-    public Guid ConnectionId
-    {
-        get
+        public int NotConnected
         {
-            lock (stateLock)
-                return connectionId;
+            get;
         }
-    }
-
-    public IPAddress? RemoteAddress
-    {
-        get
+        public int Backpressured
         {
-            lock (stateLock)
-                return remoteAddress;
+            get;
         }
-    }
-
-    public VibeNetConnectionState State
-    {
-        get
+        public int Failed
         {
-            lock (stateLock)
-                return state;
+            get;
         }
-    }
-
-    public bool IsConnected => State == VibeNetConnectionState.Connected;
-
-    public VibeNetDisconnectReason? LastDisconnectReason
-    {
-        get
+        internal BroadcastResult(int[] n)
         {
-            lock (stateLock)
-                return lastDisconnectReason;
+            Sent = n[0];
+            NotConnected = n[1];
+            Backpressured = n[2];
+            Failed = n[3];
         }
     }
-
-    public VibeNetConnectionInfo Connection
+    public readonly struct NetworkStatistics
     {
-        get
+        public long BufferedBytes
         {
-            return MakeConnectionInfo();
+            get;
         }
-    }
-
-    public VibeNetClient(
-        string remoteHost,
-        int tcpPort = 7777,
-        int? udpPort = null,
-        VibeNetConfiguration? configuration = null)
-        : base(tcpPort, udpPort, configuration)
-    {
-        if (string.IsNullOrWhiteSpace(remoteHost))
-            throw new ArgumentException("Remote host is required.", nameof(remoteHost));
-
-        RemoteHost = remoteHost;
-        messageQueue = new BoundedQueue<VibeNetMessage>(Configuration.MaxQueuedMessages);
-        disconnectedQueue =
-            new BoundedQueue<VibeNetDisconnectInfo>(
-                Configuration.MaxQueuedEvents,
-                BoundedQueueOverflowMode.DropOldest);
-    }
-
-    public override bool TryDequeueMessage(out VibeNetMessage message)
-    {
-        return messageQueue.TryDequeue(out message);
-    }
-
-    public bool TryDequeueDisconnected(out VibeNetDisconnectInfo disconnect)
-    {
-        return disconnectedQueue.TryDequeue(out disconnect);
-    }
-
-    public override async Task<VibeNetConnectResult> StartAsync(
-        CancellationToken cancellationToken = default)
-    {
-        lock (stateLock)
+        public int QueuedMessages
         {
-            if (disposed)
-                throw new ObjectDisposedException(nameof(VibeNetClient));
-
-            if (startAttempted)
-                throw new InvalidOperationException("Client instances are single-use.");
-
-            startAttempted = true;
-            state = VibeNetConnectionState.Connecting;
+            get;
         }
-
-        VibeNetOperation operation = VibeNetOperation.Resolve;
-
-        using CancellationTokenSource timeout =
-            VibeNetCancellation.CreateTimeoutSource(Configuration.ClientConnectTimeout);
-        using CancellationTokenSource startup =
-            CancellationTokenSource.CreateLinkedTokenSource(
-                cancellationToken,
-                Lifetime.Token,
-                timeout.Token);
-
-        CancellationToken token = startup.Token;
-
-        try
+        public long QueuedBytes
         {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            IPAddress[] addresses = await ResolveRemoteAddressesAsync(token).ConfigureAwait(false);
-
-            operation = VibeNetOperation.TcpConnect;
-            SocketException? lastConnectError = null;
-            foreach (IPAddress address in addresses)
-            {
-                try
-                {
-                    TcpClient candidate = new TcpClient(address.AddressFamily);
-                    await VibeNetSocket.ConnectAsync(candidate, address, TCPPort, token).ConfigureAwait(false);
-                    tcpClient = candidate;
-                    tcpStream = candidate.GetStream();
-                    connectedRemoteAddress = address;
-
-                    IPEndPoint? remoteEndPoint = candidate.Client.RemoteEndPoint as IPEndPoint;
-                    tcpRemotePort = remoteEndPoint?.Port ?? TCPPort;
-                    break;
-                }
-                catch (SocketException ex)
-                {
-                    lastConnectError = ex;
-                }
-            }
-
-            if (tcpClient == null || tcpStream == null || connectedRemoteAddress == null)
-            {
-                VibeNetFailureCode failure =
-                    lastConnectError != null &&
-                    lastConnectError.SocketErrorCode == SocketError.ConnectionRefused
-                    ? VibeNetFailureCode.ConnectionRefused
-                    : VibeNetFailureCode.SocketError;
-
-                return FailStart(
-                    failure,
-                    VibeNetOperation.TcpConnect,
-                    lastConnectError?.Message ?? "Unable to connect.",
-                    lastConnectError);
-            }
-
-            tcpConnectedAtUtc = DateTime.UtcNow;
-            Interlocked.Exchange(ref lastActivityUtcTicks, tcpConnectedAtUtc.Ticks);
-            Interlocked.Exchange(ref lastTcpActivityStamp, VibeNetTime.Timestamp);
-
-            lock (stateLock)
-                remoteAddress = NormalizeDisplayAddress(connectedRemoteAddress);
-
-            operation = VibeNetOperation.HelloHandshake;
-            NetworkFrame? hello = await VibeNetProtocol.ReadTcpFrameAsync(
-                tcpStream,
-                VibeNetProtocol.MaxControlPayloadBytes,
-                token).ConfigureAwait(false);
-
-            if (hello == null)
-                return FailStart(
-                    VibeNetFailureCode.HandshakeFailed,
-                    VibeNetOperation.HelloHandshake,
-                    "Server closed during handshake.");
-
-            if (hello.Type == VibeNetPacketType.Reject)
-                return FailStart(
-                    VibeNetFailureCode.ServerRejected,
-                    VibeNetOperation.HelloHandshake,
-                    VibeNetProtocol.ParseRejectPayload(hello.Payload));
-
-            if (hello.Type != VibeNetPacketType.Hello ||
-                !VibeNetProtocol.TryParseHelloPayload(hello.Payload, out Guid assignedId, out byte[]? tokenBytes))
-            {
-                return FailStart(
-                    VibeNetFailureCode.HandshakeFailed,
-                    VibeNetOperation.HelloHandshake,
-                    "Invalid HELLO packet.");
-            }
-
-            lock (stateLock)
-                connectionId = assignedId;
-
-            sessionToken = tokenBytes;
-
-            udpSocket = new UdpClient(connectedRemoteAddress.AddressFamily);
-            udpSocket.Connect(connectedRemoteAddress, UDPPort);
-            udpRemotePort = UDPPort;
-
-            operation = VibeNetOperation.UdpHandshake;
-            bool udpReady = await PerformUdpHandshakeAsync(token).ConfigureAwait(false);
-            if (!udpReady)
-            {
-                return FailStart(
-                    VibeNetFailureCode.Timeout,
-                    VibeNetOperation.UdpHandshake,
-                    "UDP registration acknowledgement was not received.");
-            }
-
-            operation = VibeNetOperation.ReadyHandshake;
-            await SendTcpFrameAsync(
-                VibeNetPacketType.Ready,
-                VibeNetProtocol.EmptyPayload,
-                token).ConfigureAwait(false);
-
-            NetworkFrame? readyAck = await VibeNetProtocol.ReadTcpFrameAsync(
-                tcpStream,
-                VibeNetProtocol.MaxControlPayloadBytes,
-                token).ConfigureAwait(false);
-
-            if (readyAck == null || readyAck.Type != VibeNetPacketType.ReadyAck)
-            {
-                return FailStart(
-                    VibeNetFailureCode.HandshakeFailed,
-                    VibeNetOperation.ReadyHandshake,
-                    "READY acknowledgement was not received.");
-            }
-
-            VibeNetProtocol.RequireEmptyPayload(readyAck);
-
-            lock (stateLock)
-            {
-                if (disposed || shutdownStarted)
-                {
-                    return FailStart(
-                        VibeNetFailureCode.Aborted,
-                        VibeNetOperation.Start,
-                        "Connection was closed during startup.");
-                }
-
-                connectedAtUtc = DateTime.UtcNow;
-                state = VibeNetConnectionState.Connected;
-                connectionEstablished = true;
-            }
-
-            TouchTcp();
-
-            tcpTask = RunTcpLoopAsync();
-            udpTask = RunUdpLoopAsync();
-            heartbeatTask = RunHeartbeatLoopAsync();
-
-            return VibeNetConnectResult.Succeeded();
+            get;
         }
-        catch (OperationCanceledException)
+        public long DroppedUdp
         {
-            if (cancellationToken.IsCancellationRequested)
-            {
-                AbortStart();
-                throw;
-            }
-
-            if (Lifetime.IsCancellationRequested)
-            {
-                return FailStart(
-                    VibeNetFailureCode.Aborted,
-                    VibeNetOperation.Start,
-                    "Connection was closed during startup.");
-            }
-
-                return FailStart(
-                    VibeNetFailureCode.Timeout,
-                    operation,
-                    GetConnectTimeoutMessage(operation));
+            get;
         }
-        catch (VibeNetProtocolException ex)
+        public long LostEvents
         {
-            VibeNetFailureCode code =
-                operation == VibeNetOperation.Resolve
-                ? VibeNetFailureCode.DnsResolutionFailed
-                : ex.ProtocolMismatch
-                    ? VibeNetFailureCode.ProtocolMismatch
-                    : VibeNetFailureCode.HandshakeFailed;
-
-            return FailStart(code, operation, ex.Message, ex);
+            get;
         }
-        catch (SocketException ex)
+        public int PendingSends
         {
-            VibeNetFailureCode failure =
-                operation == VibeNetOperation.Resolve
-                ? VibeNetFailureCode.DnsResolutionFailed
-                : ex.SocketErrorCode == SocketError.ConnectionRefused
-                    ? VibeNetFailureCode.ConnectionRefused
-                    : VibeNetFailureCode.SocketError;
-
-            return FailStart(failure, operation, ex.Message, ex);
+            get;
         }
-        catch (Exception ex)
+        internal NetworkStatistics(VibeNetNode n)
         {
-            return FailStart(
-                VibeNetFailureCode.InternalError,
-                operation,
-                ex.Message,
-                ex);
+            BufferedBytes = n.Budget.Used;
+            QueuedMessages = n.Messages.Count;
+            QueuedBytes = n.Messages.Bytes;
+            DroppedUdp = Interlocked.Read(ref n.Dropped);
+            LostEvents = n.EventLoss;
+            PendingSends = Volatile.Read(ref n.PendingSends);
         }
     }
-
-    public async Task<bool> SendAsync(
-        byte[] data,
-        VibeNetTransport transport,
-        CancellationToken cancellationToken = default)
+    public abstract class VibeNetNode : IDisposable
     {
-        ValidatePayload(data, transport);
-
-        if (!IsConnected)
-            throw new InvalidOperationException("Client is not connected.");
-
-        if (transport == VibeNetTransport.TCP)
+        public VibeNetConfiguration Configuration
         {
-            try
-            {
-                await SendTcpFrameAsync(
-                    VibeNetPacketType.Data,
-                    data,
-                    cancellationToken).ConfigureAwait(false);
-                return true;
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                ReportFailure(
-                    VibeNetFailureCode.SendFailure,
-                    VibeNetOperation.TcpSend,
-                    "TCP send failed.",
-                    ConnectionId,
-                    VibeNetTransport.TCP,
-                    ex);
-
-                await BeginShutdownAsync(
-                    VibeNetDisconnectReason.ConnectionLost,
-                    "TCP send failed.",
-                    true,
-                    false).ConfigureAwait(false);
-
-                return false;
-            }
+            get;
         }
-
-        try
+        public NetworkStatistics Statistics => new NetworkStatistics(this);
+        internal readonly Budget Budget;
+        internal readonly MessageQueue Messages;
+        internal readonly Ring<VibeNetFailure> Failures;
+        internal readonly Ring<DisconnectInfo> Disconnects;
+        internal readonly CancellationTokenSource Lifetime = new CancellationTokenSource();
+        internal readonly RateGate InputRate;
+        internal readonly RateGate TcpInputRate;
+        internal readonly SemaphoreSlim DatagramGate = new SemaphoreSlim(1, 1);
+        internal int PendingSends;
+        internal long Dropped;
+        internal abstract long EventLoss
         {
-            await SendUdpFrameAsync(
-                VibeNetPacketType.Data,
-                data,
-                cancellationToken).ConfigureAwait(false);
-            return true;
+            get;
         }
-        catch (OperationCanceledException)
+        private protected VibeNetNode(VibeNetConfiguration? config)
         {
-            throw;
+            Configuration = config ?? new VibeNetConfiguration();
+            Budget = new Budget(Configuration.MaxBufferedBytes);
+            Messages = new MessageQueue(Configuration);
+            Failures = new Ring<VibeNetFailure>(Configuration.MaxEvents);
+            Disconnects = new Ring<DisconnectInfo>(Configuration.MaxEvents);
+            InputRate = new RateGate(Configuration.MaxPacketsPerSecond, Configuration.MaxBytesPerSecond);
+            TcpInputRate = new RateGate(Configuration.MaxPacketsPerSecond, Configuration.MaxBytesPerSecond);
         }
-        catch (Exception ex)
+        public bool TryDequeueMessage(out VibeNetMessage message) => Messages.Take(out message);
+        public bool TryDequeueFailure(out VibeNetFailure failure) => Failures.Take(out failure);
+        public bool TryDequeueDisconnected(out DisconnectInfo info) => Disconnects.Take(out info);
+        public abstract void Dispose();
+        internal void Report(Guid? id, FailureCode code, string detail) => Failures.Add(new VibeNetFailure(id, code, detail));
+        internal abstract Task<int> SendDatagram(byte[] packet, IPEndPoint endpoint);
+        internal abstract void Closed(Link link, DisconnectReason reason, bool wasConnected);
+        internal void Validate(byte[] data, VibeNetTransport transport)
         {
-            ReportFailure(
-                VibeNetFailureCode.SendFailure,
-                VibeNetOperation.UdpSend,
-                "UDP send failed.",
-                ConnectionId,
-                VibeNetTransport.UDP,
-                ex);
-
-            return false;
+            if (data == null)
+                throw new ArgumentNullException(nameof(data));
+            if (transport != VibeNetTransport.TCP && transport != VibeNetTransport.UDP)
+                throw new ArgumentOutOfRangeException(nameof(transport));
+            if (data.Length > (transport == VibeNetTransport.TCP ? Configuration.MaxTcpPayloadBytes : Configuration.MaxUdpPayloadBytes))
+                throw new ArgumentOutOfRangeException(nameof(data));
         }
-    }
-
-    public async Task DisconnectAsync(CancellationToken cancellationToken = default)
-    {
-        Task shutdown = BeginShutdownAsync(
-            VibeNetDisconnectReason.LocalRequested,
-            "Client disconnected.",
-            true,
-            true);
-
-        await VibeNetTask.WaitAsync(shutdown, cancellationToken).ConfigureAwait(false);
-        await VibeNetTask.WaitAsync(AwaitBackgroundTasksAsync(), cancellationToken).ConfigureAwait(false);
-    }
-
-    public override void Dispose()
-    {
-        lock (stateLock)
+        internal static void Port(int port)
         {
-            if (disposed)
-                return;
-
-            disposed = true;
+            if (port < 1 || port > 65535)
+                throw new ArgumentOutOfRangeException(nameof(port));
         }
-
-        _ = BeginShutdownAsync(
-            VibeNetDisconnectReason.LocalRequested,
-            "Client disposed.",
-            connectionEstablished,
-            false);
     }
-
-    private async Task<IPAddress[]> ResolveRemoteAddressesAsync(CancellationToken cancellationToken)
+    internal sealed class Budget
     {
-        if (IPAddress.TryParse(RemoteHost, out IPAddress? parsed))
+        private long used; private readonly long maximum;
+        internal long Used => Interlocked.Read(ref used);
+        internal Budget(long max)
         {
-            IPAddress[] single = FilterAddresses(new[] { parsed });
-            if (single.Length == 0)
-            {
-                throw new SocketException((int)SocketError.AddressFamilyNotSupported);
-            }
-
-            return single;
+            maximum = max;
         }
-
-        IPAddress[] addresses = await VibeNetSocket.GetHostAddressesAsync(RemoteHost, cancellationToken)
-            .ConfigureAwait(false);
-
-        IPAddress[] filtered = FilterAddresses(addresses);
-        if (filtered.Length == 0)
-            throw new VibeNetProtocolException("No resolved address matches the configured address mode.");
-
-        return filtered;
-    }
-
-    private IPAddress[] FilterAddresses(IEnumerable<IPAddress> addresses)
-    {
-        return addresses.Where(address =>
-        {
-            return Configuration.AddressMode switch
-            {
-                VibeNetAddressMode.IPv4 => address.AddressFamily == AddressFamily.InterNetwork,
-                VibeNetAddressMode.IPv6 => address.AddressFamily == AddressFamily.InterNetworkV6,
-                VibeNetAddressMode.DualStack => address.AddressFamily == AddressFamily.InterNetwork ||
-                                                address.AddressFamily == AddressFamily.InterNetworkV6,
-                _ => throw new ArgumentOutOfRangeException(nameof(Configuration.AddressMode))
-            };
-        }).ToArray();
-    }
-
-    private async Task<bool> PerformUdpHandshakeAsync(CancellationToken overallToken)
-    {
-        if (udpSocket == null || sessionToken == null)
-            return false;
-
-        using CancellationTokenSource udpTimeout =
-            VibeNetCancellation.CreateLinkedTimeoutSource(Configuration.UDPHandshakeTimeout, overallToken);
-
-        CancellationToken token = udpTimeout.Token;
-        byte[] payload = VibeNetProtocol.CreateRegistrationPayload(ConnectionId, sessionToken);
-        Task<UdpReceiveResult> receiveTask = VibeNetSocket.ReceiveAsync(udpSocket, token);
-
-        await SendUdpFrameAsync(VibeNetPacketType.UdpRegister, payload, token).ConfigureAwait(false);
-        long nextSendAt = VibeNetTime.Timestamp + VibeNetTime.ToStopwatchTicks(Configuration.UDPHandshakeInterval);
-
-        try
+        internal bool Acquire(long size)
         {
             while (true)
             {
-                token.ThrowIfCancellationRequested();
-
-                TimeSpan waitForSend = VibeNetTime.Remaining(nextSendAt);
-                Task timerTask = Task.Delay(waitForSend, token);
-                Task completed = await Task.WhenAny(receiveTask, timerTask).ConfigureAwait(false);
-
-                if (completed == receiveTask)
+                long n = Used;
+                if (size < 0 || size > maximum - n)
+                    return false;
+                if (Interlocked.CompareExchange(ref used, n + size, n) == n)
+                    return true;
+            }
+        }
+        internal void Release(long size)
+        {
+            Interlocked.Add(ref used, -size);
+        }
+    }
+    internal sealed class Lease : IDisposable
+    {
+        private Budget? global; private readonly Budget local; private readonly long size;
+        private Lease(Budget g, Budget l, long n)
+        {
+            global = g;
+            local = l;
+            size = n;
+        }
+        internal static Lease? Try(Budget g, Budget l, long n)
+        {
+            if (!l.Acquire(n))
+                return null;
+            if (!g.Acquire(n))
+            {
+                l.Release(n);
+                return null;
+            }
+            return new Lease(g, l, n);
+        }
+        public void Dispose()
+        {
+            var g = Interlocked.Exchange(ref global, null);
+            if (g != null)
+            {
+                local.Release(size);
+                g.Release(size);
+            }
+        }
+    }
+    internal sealed class Ring<T>
+    {
+        private readonly object gate = new object(); private readonly Queue<T> q = new Queue<T>(); private readonly int max; internal long Lost;
+        internal Ring(int n)
+        {
+            max = n;
+        }
+        internal void Add(T item)
+        {
+            lock (gate)
+            {
+                if (q.Count == max)
                 {
-                    UdpReceiveResult result = await receiveTask.ConfigureAwait(false);
-
-                    if (VibeNetProtocol.TryParseUdpFrame(
-                        result.Buffer,
-                        VibeNetProtocol.MaxControlPayloadBytes,
-                        out NetworkFrame? frame) &&
-                        frame != null &&
-                        frame.Type == VibeNetPacketType.UdpAck &&
-                        VibeNetProtocol.RegistrationAckMatches(frame.Payload, ConnectionId))
+                    q.Dequeue();
+                    Interlocked.Increment(ref Lost);
+                }
+                q.Enqueue(item);
+            }
+        }
+        internal bool Take(out T item)
+        {
+            lock (gate)
+            {
+                if (q.Count == 0)
+                {
+                    item = default!;
+                    return false;
+                }
+                item = q.Dequeue();
+                return true;
+            }
+        }
+    }
+    internal sealed class RateGate
+    {
+        private readonly object gate = new object(); private readonly double pmax, bmax; private double packets, bytes; private long stamp;
+        internal RateGate(double p, double b)
+        {
+            pmax = packets = p;
+            bmax = bytes = b;
+            stamp = Clock.Now;
+        }
+        internal bool Take(int n)
+        {
+            lock (gate)
+            {
+                long now = Clock.Now;
+                double dt = (now - stamp) / (double)Stopwatch.Frequency;
+                stamp = now;
+                packets = Math.Min(pmax, packets + dt * pmax);
+                bytes = Math.Min(bmax, bytes + dt * bmax);
+                if (packets < 1 || bytes < n)
+                    return false;
+                packets--;
+                bytes -= n;
+                return true;
+            }
+        }
+    }
+    internal static class Clock
+    {
+        internal static long Now => Stopwatch.GetTimestamp();
+        internal static long Ticks(TimeSpan d) => (long)(d.TotalSeconds * Stopwatch.Frequency);
+        internal static bool Elapsed(long at, TimeSpan d) => Now - at >= Ticks(d);
+    }
+    internal sealed class MessageQueue
+    {
+        private sealed class Entry
+        {
+            internal VibeNetMessage Message; internal Lease Lease = null!; internal Entry? Prev, Next, OwnerPrev, OwnerNext, UPrev, UNext; internal Link Owner = null!;
+        }
+        private sealed class OwnerEntries
+        {
+            internal Entry? Head, Tail; internal int Count;
+        }
+        private readonly object gate = new object(); private readonly Dictionary<Link, OwnerEntries> owners = new Dictionary<Link, OwnerEntries>();
+        private Entry? head, tail, udpHead, udpTail; private int count; private long bytes; private readonly VibeNetConfiguration config;
+        internal int Count
+        {
+            get
+            {
+                lock (gate)
+                    return count;
+            }
+        }
+        internal long Bytes
+        {
+            get
+            {
+                lock (gate)
+                    return bytes;
+            }
+        }
+        internal MessageQueue(VibeNetConfiguration c)
+        {
+            config = c;
+        }
+        internal bool Add(Link owner, byte[] data, VibeNetTransport transport)
+        {
+            lock (gate)
+            {
+                if (owner.State != ConnectionState.Connected)
+                    return false;
+                if (!owners.TryGetValue(owner, out var o))
+                {
+                    o = new OwnerEntries();
+                    owners.Add(owner, o);
+                }
+                if (o.Count >= config.MaxMessagesPerConnection)
+                    return false;
+                while (count >= config.MaxQueuedMessages || data.Length > config.MaxQueuedBytes - bytes)
+                {
+                    if (transport == VibeNetTransport.UDP || udpHead == null)
+                        return false;
+                    Remove(udpHead);
+                    Interlocked.Increment(ref owner.Node.Dropped);
+                }
+                var lease = Lease.Try(owner.Node.Budget, owner.Memory, data.Length);
+                if (lease == null)
+                    return false;
+                // Remove() can unlink an empty owner entry during UDP eviction.
+                if (!owners.TryGetValue(owner, out o))
+                {
+                    o = new OwnerEntries();
+                    owners.Add(owner, o);
+                }
+                var e = new Entry { Message = new VibeNetMessage(owner.Id, transport, data), Lease = lease, Owner = owner, Prev = tail, OwnerPrev = o.Tail };
+                if (tail != null)
+                    tail.Next = e;
+                else
+                    head = e;
+                tail = e;
+                if (o.Tail != null)
+                    o.Tail.OwnerNext = e;
+                else
+                    o.Head = e;
+                o.Tail = e;
+                o.Count++;
+                if (transport == VibeNetTransport.UDP)
+                {
+                    e.UPrev = udpTail;
+                    if (udpTail != null)
+                        udpTail.UNext = e;
+                    else
+                        udpHead = e;
+                    udpTail = e;
+                }
+                count++;
+                bytes += data.Length;
+                return true;
+            }
+        }
+        internal bool Take(out VibeNetMessage message)
+        {
+            lock (gate)
+            {
+                if (head == null)
+                {
+                    message = default;
+                    return false;
+                }
+                message = head.Message;
+                Remove(head);
+                return true;
+            }
+        }
+        internal void Close(Link owner)
+        {
+            lock (gate)
+            {
+                if (owners.TryGetValue(owner, out var o))
+                {
+                    while (o.Head != null)
+                        Remove(o.Head);
+                    owners.Remove(owner);
+                }
+            }
+        }
+        private void Remove(Entry e)
+        {
+            if (e.Prev != null)
+                e.Prev.Next = e.Next;
+            else
+                head = e.Next;
+            if (e.Next != null)
+                e.Next.Prev = e.Prev;
+            else
+                tail = e.Prev;
+            var o = owners[e.Owner];
+            if (e.OwnerPrev != null)
+                e.OwnerPrev.OwnerNext = e.OwnerNext;
+            else
+                o.Head = e.OwnerNext;
+            if (e.OwnerNext != null)
+                e.OwnerNext.OwnerPrev = e.OwnerPrev;
+            else
+                o.Tail = e.OwnerPrev;
+            if (e.Message.Transport == VibeNetTransport.UDP)
+            {
+                if (e.UPrev != null)
+                    e.UPrev.UNext = e.UNext;
+                else
+                    udpHead = e.UNext;
+                if (e.UNext != null)
+                    e.UNext.UPrev = e.UPrev;
+                else
+                    udpTail = e.UPrev;
+            }
+            o.Count--;
+            if (o.Count == 0)
+                owners.Remove(e.Owner);
+            count--;
+            bytes -= e.Message.Data.Length;
+            e.Lease.Dispose();
+        }
+    }
+}
+namespace VibeNet
+{
+    internal enum Kind : byte
+    {
+        Data = 1, Register = 2, Registered = 3, Ready = 4, ReadyAck = 5, Ping = 6, Pong = 7, Bye = 8, TcpUpdate = 9, UdpUpdate = 10, UdpUpdated = 11, ByeAck = 12
+    }
+    internal sealed class ProtocolException : IOException
+    {
+        internal ProtocolException(string s) : base(s) { }
+    }
+    internal static class Crypto
+    {
+        internal const int RsaBytes = 256;
+        internal static byte[] Random(int n)
+        {
+            var b = new byte[n];
+            RandomNumberGenerator.Fill(b);
+            return b;
+        }
+        internal static void Clear(byte[]? b)
+        {
+            if (b != null)
+                CryptographicOperations.ZeroMemory(b);
+        }
+        internal static byte[] Hash(byte[] b)
+        {
+            using (var h = SHA256.Create())
+                return h.ComputeHash(b);
+        }
+        internal static byte[] Mac(byte[] key, byte[] b)
+        {
+            using (var h = new HMACSHA256(key))
+                return h.ComputeHash(b);
+        }
+        internal static byte[] Join(params byte[][] parts)
+        {
+            int n = 0;
+            foreach (var p in parts)
+                n = checked(n + p.Length);
+            var b = new byte[n];
+            n = 0;
+            foreach (var p in parts)
+            {
+                Buffer.BlockCopy(p, 0, b, n, p.Length);
+                n += p.Length;
+            }
+            return b;
+        }
+        internal static byte[] Hkdf(byte[] salt, byte[] ikm, byte[] info, int count)
+        {
+            if (count < 1 || count > 255 * 32)
+                throw new ArgumentOutOfRangeException(nameof(count));
+            byte[] prk = Mac(salt, ikm), previous = Array.Empty<byte>(), result = new byte[count];
+            try
+            {
+                int offset = 0;
+                byte index = 1;
+                while (offset < count)
+                {
+                    byte[] input = Join(previous, info, new[] { index++ });
+                    Clear(previous);
+                    previous = Mac(prk, input);
+                    Clear(input);
+                    int n = Math.Min(32, count - offset);
+                    Buffer.BlockCopy(previous, 0, result, offset, n);
+                    offset += n;
+                }
+                return result;
+            }
+            finally { Clear(prk); Clear(previous); }
+        }
+        internal static byte[] Expand(byte[] root, string label) => Hkdf(Array.Empty<byte>(), root, Encoding.ASCII.GetBytes("VNS1/" + label), 32);
+        internal static bool Equal(byte[] a, int offset, byte[] b) => offset >= 0 && a.Length - offset >= b.Length && CryptographicOperations.FixedTimeEquals(new ReadOnlySpan<byte>(a, offset, b.Length), b);
+        internal static RSA NewRsa()
+        {
+            RSA r = RSA.Create(RsaBytes * 8);
+            if (r.ExportParameters(false).Modulus!.Length == RsaBytes)
+                return r;
+            // Unity Mono's generic factory can ignore the requested size. Never accept that key.
+            r.Dispose();
+            var csp = new RSACryptoServiceProvider(RsaBytes * 8);
+            csp.PersistKeyInCsp = false;
+            if (csp.ExportParameters(false).Modulus!.Length != RsaBytes)
+            {
+                csp.Dispose();
+                throw new PlatformNotSupportedException("RSA-2048 provider unavailable.");
+            }
+            return csp;
+        }
+    }
+    internal static class Wire
+    {
+        internal const uint Magic = 0x564e5331; // VNS1: intentionally different from the plaintext prototype.
+        internal const int Header = 64, Tag = 32;
+        internal static int Size(int n) => checked(Header + (n / 16 + 1) * 16 + Tag);
+        internal static void U32(byte[] b, int o, uint n)
+        {
+            for (int i = 3; i >= 0; i--)
+            {
+                b[o + i] = (byte)n;
+                n >>= 8;
+            }
+        }
+        internal static uint U32(byte[] b, int o) => ((uint)b[o] << 24) | ((uint)b[o + 1] << 16) | ((uint)b[o + 2] << 8) | b[o + 3];
+        internal static void U64(byte[] b, int o, ulong n)
+        {
+            for (int i = 7; i >= 0; i--)
+            {
+                b[o + i] = (byte)n;
+                n >>= 8;
+            }
+        }
+        internal static ulong U64(byte[] b, int o)
+        {
+            ulong n = 0;
+            for (int i = 0; i < 8; i++)
+                n = (n << 8) | b[o + i];
+            return n;
+        }
+        internal static Guid Id(byte[] b) => new Guid(new ReadOnlySpan<byte>(b, 8, 16));
+        internal static bool HeaderValid(byte[] b, VibeNetTransport lane, int max)
+        {
+            if (b.Length < Header || U32(b, 0) != Magic || b[4] != 1 || b[6] != (byte)lane || b[7] != 0 || U32(b, 44) != 0)
+                return false;
+            int plain = unchecked((int)U32(b, 36));
+            if (plain < 0 || plain > max || U32(b, 40) != (uint)((plain / 16 + 1) * 16))
+                return false;
+            var k = (Kind)b[5];
+            if (k == Kind.Data)
+                return true;
+            if (lane == VibeNetTransport.UDP)
+                return (k == Kind.Register || k == Kind.Registered) && plain == 0;
+            return ((k == Kind.Ready || k == Kind.ReadyAck || k == Kind.Ping || k == Kind.Pong || k == Kind.TcpUpdate || k == Kind.ByeAck) && plain == 0)
+                || (k == Kind.Bye && plain == 1) || ((k == Kind.UdpUpdate || k == Kind.UdpUpdated) && plain == 4);
+        }
+        internal static async Task ReadExact(Stream s, byte[] b, int offset, int count, CancellationToken token)
+        {
+            while (count > 0)
+            {
+                int n = await s.ReadAsync(b, offset, count, token).ConfigureAwait(false);
+                if (n == 0)
+                    throw new EndOfStreamException();
+                offset += n;
+                count -= n;
+            }
+        }
+        internal static async Task PlainWrite(Stream s, byte type, byte[] p, CancellationToken ct)
+        {
+            var b = new byte[12 + p.Length];
+            U32(b, 0, Magic);
+            b[4] = 1;
+            b[5] = type;
+            U32(b, 8, (uint)p.Length);
+            Buffer.BlockCopy(p, 0, b, 12, p.Length);
+            await s.WriteAsync(b, 0, b.Length, ct).ConfigureAwait(false);
+        }
+        internal static async Task<byte[]> PlainRead(Stream s, byte type, int length, CancellationToken ct)
+        {
+            var h = new byte[12];
+            await ReadExact(s, h, 0, 12, ct).ConfigureAwait(false);
+            if (U32(h, 0) != Magic || h[4] != 1 || h[5] != type || h[6] != 0 || h[7] != 0 || U32(h, 8) != length)
+                throw new ProtocolException("Invalid handshake frame.");
+            var p = new byte[length];
+            await ReadExact(s, p, 0, length, ct).ConfigureAwait(false);
+            return p;
+        }
+        internal static async Task Wait(Task task, CancellationToken ct)
+        {
+            if (!ct.CanBeCanceled)
+            {
+                await task.ConfigureAwait(false);
+                return;
+            }
+            var canceled = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            using (ct.Register(() => canceled.TrySetCanceled()))
+            {
+                if (await Task.WhenAny(task, canceled.Task).ConfigureAwait(false) != task)
+                {
+                    _ = task.ContinueWith(t => { _ = t.Exception; }, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                    ct.ThrowIfCancellationRequested();
+                }
+                await task.ConfigureAwait(false);
+            }
+        }
+    }
+    internal sealed class Lane : IDisposable
+    {
+        internal const ulong RecordLimit = 65536;
+        internal const long ByteLimit = 67108864;
+        internal readonly uint Epoch; private byte[] secret; private readonly byte[] enc, mac;
+        private readonly Aes aes; private readonly HMACSHA256 hmac;
+        internal ulong Sequence; internal long Bytes;
+        private ulong high; private bool any; private readonly ulong[] seen = new ulong[256];
+        internal bool NeedsUpdate => Sequence >= RecordLimit || Bytes >= ByteLimit;
+        internal Lane(byte[] root, uint epoch = 0)
+        {
+            secret = root;
+            Epoch = epoch;
+            enc = Crypto.Expand(root, "encryption");
+            mac = Crypto.Expand(root, "authentication");
+            aes = Aes.Create();
+            aes.Key = enc;
+            aes.Mode = CipherMode.CBC;
+            aes.Padding = PaddingMode.PKCS7;
+            hmac = new HMACSHA256(mac);
+            for (int i = 0; i < seen.Length; i++)
+                seen[i] = ulong.MaxValue;
+        }
+        internal Lane Next()
+        {
+            if (Epoch == uint.MaxValue)
+                throw new ProtocolException("Key epoch exhausted.");
+            return new Lane(Crypto.Expand(secret, "next"), Epoch + 1);
+        }
+        internal byte[] Seal(Guid id, Kind type, VibeNetTransport transport, byte[] plaintext)
+        {
+            if (Sequence >= RecordLimit + 64 || Bytes > ByteLimit + 16777216L + 4096)
+                throw new ProtocolException("Key usage exhausted.");
+            byte[] b = new byte[Wire.Size(plaintext.Length)];
+            Wire.U32(b, 0, Wire.Magic);
+            b[4] = 1;
+            b[5] = (byte)type;
+            b[6] = (byte)transport;
+            id.TryWriteBytes(new Span<byte>(b, 8, 16));
+            Wire.U32(b, 24, Epoch);
+            Wire.U64(b, 28, Sequence++);
+            Wire.U32(b, 36, (uint)plaintext.Length);
+            Wire.U32(b, 40, (uint)(b.Length - Wire.Header - Wire.Tag));
+            var iv = Crypto.Random(16);
+            Buffer.BlockCopy(iv, 0, b, 48, 16);
+            using (var transform = aes.CreateEncryptor(enc, iv))
+            {
+                var c = transform.TransformFinalBlock(plaintext, 0, plaintext.Length);
+                Buffer.BlockCopy(c, 0, b, 64, c.Length);
+            }
+            byte[] tag = hmac.ComputeHash(b, 0, b.Length - 32);
+            Buffer.BlockCopy(tag, 0, b, b.Length - 32, 32);
+            Bytes += plaintext.Length;
+            return b;
+        }
+        internal byte[]? Open(byte[] b, Guid id, VibeNetTransport transport, int max)
+        {
+            if (!Wire.HeaderValid(b, transport, max) || Wire.Id(b) != id || Wire.U32(b, 24) != Epoch || b.Length != Wire.Size((int)Wire.U32(b, 36)))
+                return null;
+            ulong seq = Wire.U64(b, 28);
+            if (seq >= RecordLimit + 64 || Bytes + Wire.U32(b, 36) > ByteLimit + max + 4096L)
+                return null;
+            if (transport == VibeNetTransport.TCP)
+            {
+                if (seq != Sequence)
+                    return null;
+            }
+            else if ((any && high >= 256 && seq <= high - 256) || seen[seq % 256] == seq)
+                return null;
+            byte[] tag = hmac.ComputeHash(b, 0, b.Length - 32);
+            if (!Crypto.Equal(b, b.Length - 32, tag))
+                return null;
+            // Encrypt-then-MAC: no padding processing or decryption before MAC verification.
+            var iv = new byte[16];
+            Buffer.BlockCopy(b, 48, iv, 0, 16);
+            byte[] p;
+            using (var t = aes.CreateDecryptor(enc, iv))
+                p = t.TransformFinalBlock(b, 64, b.Length - 96);
+            if (p.Length != Wire.U32(b, 36))
+            {
+                Crypto.Clear(p);
+                return null;
+            }
+            if (transport == VibeNetTransport.TCP)
+                Sequence++;
+            else
+            {
+                seen[seq % 256] = seq;
+                if (!any || seq > high)
+                    high = seq;
+                any = true;
+            }
+            Bytes += p.Length;
+            return p;
+        }
+        public void Dispose()
+        {
+            aes.Dispose();
+            hmac.Dispose();
+            Crypto.Clear(secret);
+            Crypto.Clear(enc);
+            Crypto.Clear(mac);
+        }
+    }
+    internal sealed class Link
+    {
+        internal readonly VibeNetNode Node; internal readonly TcpClient Tcp; internal readonly NetworkStream Stream;
+        internal readonly IPEndPoint TcpEndpoint; internal volatile IPEndPoint? UdpEndpoint;
+        internal readonly Budget Memory; internal Guid Id;
+        private int state = (int)ConnectionState.Connecting;
+        internal ConnectionState State => (ConnectionState)Volatile.Read(ref state);
+        internal readonly CancellationTokenSource Stop = new CancellationTokenSource();
+        internal Task Work = Task.CompletedTask;
+        private readonly SemaphoreSlim tcpSend = new SemaphoreSlim(1, 1), udpSend = new SemaphoreSlim(1, 1);
+        private readonly object receiveGate = new object(); private readonly object lifeGate = new object();
+        private Lane? tcpTx, tcpRx, udpTx, udpRx, previousUdp;
+        private long previousUntil, lastTcp = Clock.Now; internal long NextHeartbeat; internal int HeapIndex = -1;
+        private int sends, closed; private bool server; private int users; private bool disposed;
+        private DisconnectReason? requestedClose;
+        private readonly TaskCompletionSource<bool> byeAck = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal readonly TaskCompletionSource<bool> Completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<bool> registered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        private TaskCompletionSource<bool>? updateAck; private uint expectedAck;
+        private readonly RateGate packets, udpPackets, controls = new RateGate(32, 65536);
+        internal Link(VibeNetNode node, TcpClient tcp, Guid id, bool isServer)
+        {
+            Node = node;
+            Tcp = tcp;
+            Stream = tcp.GetStream();
+            Tcp.NoDelay = true;
+            TcpEndpoint = (IPEndPoint)tcp.Client.RemoteEndPoint!;
+            Id = id;
+            server = isServer;
+            Memory = new Budget(node.Configuration.MaxBufferedBytesPerConnection);
+            packets = new RateGate(node.Configuration.MaxPacketsPerSecondPerConnection, node.Configuration.MaxBytesPerSecond);
+            udpPackets = new RateGate(node.Configuration.MaxPacketsPerSecondPerConnection, node.Configuration.MaxBytesPerSecond);
+            NextHeartbeat = Clock.Now + Clock.Ticks(node.Configuration.HeartbeatInterval) + (long)(Math.Abs(id.GetHashCode() % 1000) / 1000.0 * Clock.Ticks(node.Configuration.HeartbeatInterval));
+        }
+        internal bool Enter()
+        {
+            lock (lifeGate)
+            {
+                if (closed != 0)
+                    return false;
+                users++;
+                return true;
+            }
+        }
+        internal void Exit()
+        {
+            lock (lifeGate)
+            {
+                users--;
+                if (closed != 0 && users == 0)
+                    Cleanup();
+            }
+        }
+        private void Cleanup()
+        {
+            if (disposed)
+                return;
+            disposed = true;
+            tcpTx?.Dispose();
+            tcpRx?.Dispose();
+            udpTx?.Dispose();
+            udpRx?.Dispose();
+            previousUdp?.Dispose();
+            tcpSend.Dispose();
+            udpSend.Dispose();
+            Stop.Dispose();
+            Completion.TrySetResult(true);
+        }
+        internal void Close(DisconnectReason reason)
+        {
+            lock (lifeGate)
+            {
+                if (closed != 0)
+                    return;
+                closed = 1;
+                if (requestedClose.HasValue && reason == DisconnectReason.ConnectionLost)
+                    reason = requestedClose.Value;
+                bool connected = State == ConnectionState.Connected || State == ConnectionState.Closing;
+                Volatile.Write(ref state, (int)ConnectionState.Closed);
+                Stop.Cancel();
+                Tcp.Close();
+                registered.TrySetCanceled();
+                updateAck?.TrySetCanceled();
+                byeAck.TrySetCanceled();
+                Node.Messages.Close(this);
+                Node.Closed(this, reason, connected);
+                if (users == 0)
+                    Cleanup();
+            }
+        }
+        private void Setup(byte[] root)
+        {
+            string tx = server ? "s2c" : "c2s", rx = server ? "c2s" : "s2c";
+            lock (receiveGate)
+            {
+                tcpTx = new Lane(Crypto.Expand(root, tx + "/tcp"));
+                tcpRx = new Lane(Crypto.Expand(root, rx + "/tcp"));
+                udpTx = new Lane(Crypto.Expand(root, tx + "/udp"));
+                udpRx = new Lane(Crypto.Expand(root, rx + "/udp"));
+            }
+        }
+        internal void Connected()
+        {
+            lock (lifeGate)
+            {
+                if (closed != 0)
+                    throw new OperationCanceledException();
+                Volatile.Write(ref state, (int)ConnectionState.Connected);
+                Interlocked.Exchange(ref lastTcp, Clock.Now);
+            }
+        }
+        internal async Task Handshake(CancellationToken token)
+        {
+            byte[] hello, reply, seed, root;
+            byte[] context = Encoding.ASCII.GetBytes("VNS1/RSA2048-OAEP-SHA1/AES256-CBC-HMACSHA256/handshake");
+            if (server)
+            {
+                using (RSA rsa = Crypto.NewRsa())
+                {
+                    var pub = rsa.ExportParameters(false);
+                    if (pub.Modulus!.Length != Crypto.RsaBytes || pub.Exponent!.Length != 3)
+                        throw new CryptographicException("Unsupported RSA encoding.");
+                    hello = Crypto.Join(Id.ToByteArray(), Crypto.Random(32), pub.Modulus, pub.Exponent);
+                    await Wire.PlainWrite(Stream, 100, hello, token).ConfigureAwait(false);
+                    reply = await Wire.PlainRead(Stream, 101, 32 + Crypto.RsaBytes, token).ConfigureAwait(false);
+                    var encrypted = new byte[Crypto.RsaBytes];
+                    Buffer.BlockCopy(reply, 32, encrypted, 0, Crypto.RsaBytes);
+                    seed = rsa.Decrypt(encrypted, RSAEncryptionPadding.OaepSHA1);
+                    if (seed.Length != 32)
                     {
-                        return true;
+                        Crypto.Clear(seed);
+                        throw new ProtocolException("Invalid key transport.");
                     }
-
-                    receiveTask = VibeNetSocket.ReceiveAsync(udpSocket, token);
-                    continue;
                 }
-
-                await timerTask.ConfigureAwait(false);
-                await SendUdpFrameAsync(VibeNetPacketType.UdpRegister, payload, token).ConfigureAwait(false);
-                nextSendAt = VibeNetTime.Timestamp + VibeNetTime.ToStopwatchTicks(Configuration.UDPHandshakeInterval);
             }
-        }
-        catch (OperationCanceledException)
-        {
-            if (overallToken.IsCancellationRequested)
-                throw;
-
-            return false;
-        }
-    }
-
-    private async Task RunTcpLoopAsync()
-    {
-        if (tcpStream == null)
-            return;
-
-        VibeNetDisconnectReason finalReason = VibeNetDisconnectReason.ConnectionLost;
-        string finalDetail = "TCP connection closed.";
-
-        try
-        {
-            while (!Lifetime.IsCancellationRequested)
+            else
             {
-                NetworkFrame? frame = await VibeNetProtocol.ReadTcpFrameAsync(
-                    tcpStream,
-                    Math.Max(Configuration.MaxTCPPayloadBytes, VibeNetProtocol.MaxControlPayloadBytes),
-                    Lifetime.Token).ConfigureAwait(false);
-
-                if (frame == null)
-                    break;
-
-                TouchTcp();
-                await HandleConnectedTcpFrameAsync(frame).ConfigureAwait(false);
-            }
-        }
-        catch (VibeNetDisconnectSignal signal)
-        {
-            finalReason = signal.Reason;
-            finalDetail = signal.Detail;
-        }
-        catch (OperationCanceledException) when (Lifetime.IsCancellationRequested)
-        {
-            finalReason = VibeNetDisconnectReason.LocalRequested;
-            finalDetail = "Client disconnected.";
-        }
-        catch (VibeNetProtocolException ex)
-        {
-            ReportFailure(
-                VibeNetFailureCode.ProtocolError,
-                VibeNetOperation.TcpReceive,
-                ex.Message,
-                ConnectionId,
-                VibeNetTransport.TCP,
-                ex);
-
-            finalReason = VibeNetDisconnectReason.ProtocolError;
-            finalDetail = ex.Message;
-        }
-        catch (Exception ex)
-        {
-            if (!shutdownStarted)
-            {
-                ReportReceiveException(
-                    VibeNetOperation.TcpReceive,
-                    "TCP receive failed.",
-                    ex,
-                    ConnectionId,
-                    VibeNetTransport.TCP);
-            }
-        }
-        finally
-        {
-            await BeginShutdownAsync(finalReason, finalDetail, true, false).ConfigureAwait(false);
-        }
-    }
-
-    private async Task HandleConnectedTcpFrameAsync(NetworkFrame frame)
-    {
-        switch (frame.Type)
-        {
-            case VibeNetPacketType.Ping:
-                VibeNetProtocol.RequireEmptyPayload(frame);
-                using (CancellationTokenSource timeout = VibeNetCancellation.CreateTimeoutSource(Configuration.TCPHeartbeatInterval))
+                hello = await Wire.PlainRead(Stream, 100, 51 + Crypto.RsaBytes, token).ConfigureAwait(false);
+                var id = new byte[16];
+                Buffer.BlockCopy(hello, 0, id, 0, 16);
+                Id = new Guid(id);
+                var modulus = new byte[Crypto.RsaBytes];
+                Buffer.BlockCopy(hello, 48, modulus, 0, Crypto.RsaBytes);
+                if ((modulus[0] & 128) == 0 || (modulus[Crypto.RsaBytes - 1] & 1) == 0 || hello[48 + Crypto.RsaBytes] != 1 || hello[49 + Crypto.RsaBytes] != 0 || hello[50 + Crypto.RsaBytes] != 1)
+                    throw new ProtocolException("Invalid RSA key.");
+                seed = Crypto.Random(32);
+                try
                 {
-                    await SendTcpFrameAsync(
-                        VibeNetPacketType.Pong,
-                        VibeNetProtocol.EmptyPayload,
-                        timeout.Token).ConfigureAwait(false);
+                    using (RSA rsa = RSA.Create())
+                    {
+                        rsa.ImportParameters(new RSAParameters { Modulus = modulus, Exponent = new byte[] { 1, 0, 1 } });
+                        reply = Crypto.Join(Crypto.Random(32), rsa.Encrypt(seed, RSAEncryptionPadding.OaepSHA1));
+                    }
                 }
-
+                catch { Crypto.Clear(seed); throw; }
+                try
+                {
+                    await Wire.PlainWrite(Stream, 101, reply, token).ConfigureAwait(false);
+                }
+                catch { Crypto.Clear(seed); throw; }
+            }
+            try
+            {
+                byte[] transcript = Crypto.Hash(Crypto.Join(context, hello, reply));
+                root = Crypto.Hkdf(transcript, seed, context, 32);
+            }
+            finally { Crypto.Clear(seed); }
+            try
+            {
+                byte[] clientFinished = Crypto.Expand(root, "client-finished"), serverFinished = Crypto.Expand(root, "server-finished");
+                try
+                {
+                    if (server)
+                    {
+                        var proof = await Wire.PlainRead(Stream, 102, 32, token).ConfigureAwait(false);
+                        if (!Crypto.Equal(proof, 0, clientFinished))
+                            throw new ProtocolException("Key confirmation failed.");
+                        Setup(root);
+                        await Wire.PlainWrite(Stream, 103, serverFinished, token).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await Wire.PlainWrite(Stream, 102, clientFinished, token).ConfigureAwait(false);
+                        var proof = await Wire.PlainRead(Stream, 103, 32, token).ConfigureAwait(false);
+                        if (!Crypto.Equal(proof, 0, serverFinished))
+                            throw new ProtocolException("Key confirmation failed.");
+                        Setup(root);
+                    }
+                }
+                finally { Crypto.Clear(clientFinished); Crypto.Clear(serverFinished); }
+            }
+            finally { Crypto.Clear(root); }
+            if (server)
+            {
+                using (var frame = await ReadTcp(token, Kind.Ready).ConfigureAwait(false))
+                {
+                    if (UdpEndpoint == null)
+                        throw new ProtocolException("UDP registration required.");
+                }
+                await Control(Kind.ReadyAck, Array.Empty<byte>(), token).ConfigureAwait(false);
+                Connected();
+            }
+            else
+            {
+                while (!registered.Task.IsCompleted)
+                {
+                    await Control(Kind.Register, Array.Empty<byte>(), token, true).ConfigureAwait(false);
+                    using (var retry = CancellationTokenSource.CreateLinkedTokenSource(token))
+                    {
+                        Task delay = Task.Delay(Node.Configuration.UdpRetryInterval, retry.Token);
+                        await Task.WhenAny(registered.Task, delay).ConfigureAwait(false);
+                        retry.Cancel();
+                        token.ThrowIfCancellationRequested();
+                    }
+                }
+                await registered.Task.ConfigureAwait(false);
+                await Control(Kind.Ready, Array.Empty<byte>(), token).ConfigureAwait(false);
+                using (var frame = await ReadTcp(token, Kind.ReadyAck).ConfigureAwait(false))
+                {
+                }
+                Connected();
+            }
+        }
+        private sealed class Received : IDisposable
+        {
+            internal Kind Type; internal byte[] Data; private Lease lease; internal Received(Kind type, byte[] data, Lease l)
+            {
+                Type = type;
+                Data = data;
+                lease = l;
+            }
+            public void Dispose() => lease.Dispose();
+        }
+        private async Task<Received> ReadTcp(CancellationToken token, Kind? expected = null)
+        {
+            byte[] header = new byte[64];
+            await Wire.ReadExact(Stream, header, 0, 64, token).ConfigureAwait(false);
+            if (!Wire.HeaderValid(header, VibeNetTransport.TCP, Node.Configuration.MaxTcpPayloadBytes) || (expected.HasValue && (Kind)header[5] != expected.Value))
+                throw new ProtocolException("Invalid TCP header/state.");
+            int size = Wire.Size((int)Wire.U32(header, 36));
+            if (!Node.TcpInputRate.Take(size) || !packets.Take(size))
+                throw new ResourceException();
+            var lease = Lease.Try(Node.Budget, Memory, checked(size * 4L));
+            if (lease == null)
+                throw new ResourceException();
+            try
+            {
+                byte[] packet = new byte[size];
+                Buffer.BlockCopy(header, 0, packet, 0, 64);
+                await Wire.ReadExact(Stream, packet, 64, size - 64, token).ConfigureAwait(false);
+                byte[]? data = tcpRx!.Open(packet, Id, VibeNetTransport.TCP, Node.Configuration.MaxTcpPayloadBytes);
+                if (data == null)
+                    throw new CryptographicException("Invalid protected TCP record.");
+                Interlocked.Exchange(ref lastTcp, Clock.Now);
+                return new Received((Kind)packet[5], data, lease);
+            }
+            catch { lease.Dispose(); throw; }
+        }
+        internal async Task Run()
+        {
+            if (!Enter())
                 return;
-
-            case VibeNetPacketType.Data:
-                if (frame.Payload.Length > Configuration.MaxTCPPayloadBytes)
-                    throw new VibeNetProtocolException("TCP payload exceeds configured maximum.");
-
-                if (!messageQueue.TryEnqueue(
-                    new VibeNetMessage(null, VibeNetTransport.TCP, frame.Payload)))
+            try
+            {
+                while (State == ConnectionState.Connected || State == ConnectionState.Closing)
                 {
-                    ReportFailure(
-                        VibeNetFailureCode.QueueOverflow,
-                        VibeNetOperation.TcpReceive,
-                        "Reliable message queue limit exceeded.",
-                        ConnectionId,
-                        VibeNetTransport.TCP);
-
-                    throw new VibeNetDisconnectSignal(
-                        VibeNetDisconnectReason.ResourceLimit,
-                        "Reliable message queue limit exceeded.");
+                    using (var frame = await ReadTcp(Stop.Token).ConfigureAwait(false))
+                    {
+                        if (frame.Type != Kind.Data && !controls.Take(frame.Data.Length))
+                            throw new ResourceException();
+                        switch (frame.Type)
+                        {
+                            case Kind.Data:
+                                if (State == ConnectionState.Connected && !Node.Messages.Add(this, frame.Data, VibeNetTransport.TCP))
+                                    throw new ResourceException();
+                                break;
+                            case Kind.Ping:
+                                if (server)
+                                    throw new ProtocolException("Unexpected ping.");
+                                await Control(Kind.Pong, Array.Empty<byte>(), Stop.Token).ConfigureAwait(false);
+                                break;
+                            case Kind.Pong:
+                                if (!server)
+                                    throw new ProtocolException("Unexpected pong.");
+                                break;
+                            case Kind.Bye:
+                                if (frame.Data[0] > 1 || (server && frame.Data[0] != 0))
+                                    throw new ProtocolException("Invalid close code.");
+                                try
+                                {
+                                    await Control(Kind.ByeAck, Array.Empty<byte>(), Stop.Token).ConfigureAwait(false);
+                                }
+                                finally { Close(frame.Data[0] == 1 ? DisconnectReason.ServerStopped : DisconnectReason.RemoteRequested); }
+                                return;
+                            case Kind.ByeAck:
+                                if (State != ConnectionState.Closing)
+                                    throw new ProtocolException("Unexpected close acknowledgment.");
+                                byeAck.TrySetResult(true);
+                                return;
+                            case Kind.TcpUpdate:
+                                var next = tcpRx!.Next();
+                                tcpRx.Dispose();
+                                tcpRx = next;
+                                break;
+                            case Kind.UdpUpdate:
+                                uint epoch = Wire.U32(frame.Data, 0);
+                                lock (receiveGate)
+                                {
+                                    if (epoch != udpRx!.Epoch + 1)
+                                        throw new ProtocolException("Invalid key update.");
+                                    previousUdp?.Dispose();
+                                    previousUdp = udpRx;
+                                    udpRx = previousUdp.Next();
+                                    previousUntil = Clock.Now + Clock.Ticks(TimeSpan.FromSeconds(2));
+                                }
+                                await Control(Kind.UdpUpdated, frame.Data, Stop.Token).ConfigureAwait(false);
+                                break;
+                            case Kind.UdpUpdated:
+                                lock (receiveGate)
+                                {
+                                    if (updateAck == null || Wire.U32(frame.Data, 0) != expectedAck)
+                                        throw new ProtocolException("Unexpected key acknowledgment.");
+                                    updateAck.TrySetResult(true);
+                                }
+                                break;
+                            default:
+                                throw new ProtocolException("Unexpected TCP control.");
+                        }
+                    }
                 }
-
+            }
+            catch (Exception ex) { Fail(ex); }
+            finally { Close(DisconnectReason.ConnectionLost); Exit(); }
+        }
+        internal async Task ReceiveUdp(byte[] packet, IPEndPoint endpoint)
+        {
+            if (!Enter())
                 return;
-
-            case VibeNetPacketType.Disconnect:
-                VibeNetDisconnectCode code = VibeNetProtocol.ParseDisconnectPayload(frame.Payload);
-                if (code == VibeNetDisconnectCode.ClientRequested)
-                    throw new VibeNetProtocolException("Server sent an invalid disconnect code.");
-
-                throw new VibeNetDisconnectSignal(
-                    code == VibeNetDisconnectCode.ServerStopping
-                        ? VibeNetDisconnectReason.ServerStopped
-                        : VibeNetDisconnectReason.RemoteRequested,
-                    code == VibeNetDisconnectCode.ServerStopping
-                        ? "Server stopped."
-                        : "Server requested disconnection.");
-
-            default:
-                throw new VibeNetProtocolException("Unexpected TCP packet from server: " + frame.Type + ".");
-        }
-    }
-
-    private async Task RunUdpLoopAsync()
-    {
-        if (udpSocket == null)
-            return;
-
-        try
-        {
-            while (!Lifetime.IsCancellationRequested)
+            try
             {
-                UdpReceiveResult result =
-                    await VibeNetSocket.ReceiveAsync(udpSocket, Lifetime.Token).ConfigureAwait(false);
-
-                if (!VibeNetProtocol.TryParseUdpFrame(
-                    result.Buffer,
-                    Math.Max(Configuration.MaxUDPPayloadBytes, VibeNetProtocol.MaxControlPayloadBytes),
-                    out NetworkFrame? frame))
+                // Unauthenticated datagrams must never spend the TCP budget and disconnect a victim.
+                if (!udpPackets.Take(packet.Length))
                 {
-                    continue;
-                }
-
-                if (frame == null || frame.Type != VibeNetPacketType.Data)
-                    continue;
-
-                if (frame.Payload.Length > Configuration.MaxUDPPayloadBytes)
-                {
-                    ReportFailure(
-                        VibeNetFailureCode.ProtocolError,
-                        VibeNetOperation.UdpReceive,
-                        "UDP payload exceeds configured maximum.",
-                        ConnectionId,
-                        VibeNetTransport.UDP);
-                    continue;
-                }
-
-                TouchActivity();
-
-                if (!messageQueue.TryEnqueue(
-                    new VibeNetMessage(null, VibeNetTransport.UDP, frame.Payload)))
-                {
-                    ReportFailure(
-                        VibeNetFailureCode.QueueOverflow,
-                        VibeNetOperation.UdpReceive,
-                        "Incoming UDP datagram dropped because the queue is full.",
-                        ConnectionId,
-                        VibeNetTransport.UDP);
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (ObjectDisposedException)
-        {
-        }
-        catch (Exception ex)
-        {
-            if (!shutdownStarted)
-            {
-                ReportReceiveException(
-                    VibeNetOperation.UdpReceive,
-                    "UDP receive loop failed.",
-                    ex,
-                    ConnectionId,
-                    VibeNetTransport.UDP);
-            }
-
-            await BeginShutdownAsync(
-                VibeNetDisconnectReason.ConnectionLost,
-                "UDP transport failed.",
-                true,
-                false).ConfigureAwait(false);
-        }
-    }
-
-    private async Task RunHeartbeatLoopAsync()
-    {
-        try
-        {
-            while (!Lifetime.IsCancellationRequested)
-            {
-                await Task.Delay(Configuration.TCPHeartbeatInterval, Lifetime.Token).ConfigureAwait(false);
-
-                if (VibeNetTime.HasElapsed(
-                    Interlocked.Read(ref lastTcpActivityStamp),
-                    Configuration.TCPHeartbeatTimeout))
-                {
-                    await BeginShutdownAsync(
-                        VibeNetDisconnectReason.Timeout,
-                        "TCP heartbeat timed out.",
-                        true,
-                        false).ConfigureAwait(false);
+                    Interlocked.Increment(ref Node.Dropped);
                     return;
                 }
+                using (var lease = Lease.Try(Node.Budget, Memory, packet.Length * 4L))
+                {
+                    if (lease == null)
+                    {
+                        Interlocked.Increment(ref Node.Dropped);
+                        return;
+                    }
+                    Kind type = (Kind)packet[5];
+                    byte[]? data;
+                    lock (receiveGate)
+                    {
+                        if (udpRx == null || (UdpEndpoint != null && !EndpointsEqual(UdpEndpoint, endpoint)))
+                        {
+                            Interlocked.Increment(ref Node.Dropped);
+                            return;
+                        }
+                        if (type != Kind.Data && type != (server ? Kind.Register : Kind.Registered))
+                        {
+                            Interlocked.Increment(ref Node.Dropped);
+                            return;
+                        }
+                        uint epoch = Wire.U32(packet, 24);
+                        Lane? lane = epoch == udpRx.Epoch ? udpRx : previousUdp != null && Clock.Now < previousUntil && epoch == previousUdp.Epoch ? previousUdp : null;
+                        data = lane?.Open(packet, Id, VibeNetTransport.UDP, Node.Configuration.MaxUdpPayloadBytes);
+                        if (data == null)
+                        {
+                            Interlocked.Increment(ref Node.Dropped);
+                            return;
+                        }
+                        if (type == Kind.Register && server)
+                        {
+                            if (UdpEndpoint == null)
+                                UdpEndpoint = new IPEndPoint(endpoint.Address, endpoint.Port);
+                        }
+                    }
+                    if (type == Kind.Register && controls.Take(0))
+                        await Control(Kind.Registered, Array.Empty<byte>(), Stop.Token, true).ConfigureAwait(false);
+                    else if (type == Kind.Registered)
+                        registered.TrySetResult(true);
+                    else if (type == Kind.Data && !Node.Messages.Add(this, data, VibeNetTransport.UDP))
+                        Interlocked.Increment(ref Node.Dropped);
+                }
             }
+            catch (CryptographicException) { Interlocked.Increment(ref Node.Dropped); }
+            catch (OperationCanceledException) { }
+            catch (ObjectDisposedException) { }
+            catch (SocketException) { Interlocked.Increment(ref Node.Dropped); }
+            finally { Exit(); }
         }
-        catch (OperationCanceledException)
+        internal static bool EndpointsEqual(IPEndPoint a, IPEndPoint b) => a.Port == b.Port && (a.Address.Equals(b.Address) || a.Address.MapToIPv6().Equals(b.Address.MapToIPv6()));
+        internal Task<SendResult> Send(byte[] data, VibeNetTransport lane, CancellationToken ct)
         {
-        }
-    }
-
-    private async Task SendTcpFrameAsync(
-        VibeNetPacketType type,
-        byte[] payload,
-        CancellationToken cancellationToken)
-    {
-        NetworkStream stream = tcpStream ?? throw new ObjectDisposedException(nameof(VibeNetClient));
-
-        await tcpSendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            if (State != VibeNetConnectionState.Connected &&
-                type == VibeNetPacketType.Data)
+            Node.Validate(data, lane);
+            ct.ThrowIfCancellationRequested();
+            if (State != ConnectionState.Connected || !Enter())
+                return Task.FromResult(SendResult.NotConnected);
+            if (Interlocked.Increment(ref Node.PendingSends) > Node.Configuration.MaxPendingSends)
             {
-                throw new InvalidOperationException("Client is not connected.");
+                Interlocked.Decrement(ref Node.PendingSends);
+                Exit();
+                return Task.FromResult(SendResult.Backpressured);
             }
-
-            await VibeNetProtocol.WriteTcpFrameAsync(
-                stream,
-                type,
-                payload,
-                cancellationToken).ConfigureAwait(false);
+            if (Interlocked.Increment(ref sends) > Node.Configuration.MaxPendingSendsPerConnection)
+            {
+                Interlocked.Decrement(ref sends);
+                Interlocked.Decrement(ref Node.PendingSends);
+                Exit();
+                return Task.FromResult(SendResult.Backpressured);
+            }
+            Lease? lease = Lease.Try(Node.Budget, Memory, Wire.Size(data.Length) * 4L);
+            if (lease == null)
+            {
+                Interlocked.Decrement(ref sends);
+                Interlocked.Decrement(ref Node.PendingSends);
+                Exit();
+                return Task.FromResult(SendResult.Backpressured);
+            }
+            return SendCore(data, lane, ct, lease);
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        private async Task<SendResult> SendCore(byte[] data, VibeNetTransport lane, CancellationToken ct, Lease lease)
         {
             try
             {
-                tcpClient?.Close();
+                using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct, Stop.Token))
+                {
+                    timeout.CancelAfter(Node.Configuration.SendTimeout);
+                    await Write(Kind.Data, data, lane, timeout.Token).ConfigureAwait(false);
+                    return SendResult.Sent;
+                }
             }
-            catch
+            catch (OperationCanceledException) { if (ct.IsCancellationRequested) throw; if (State == ConnectionState.Closed) return SendResult.NotConnected; Node.Report(Id, FailureCode.Timeout, "Send deadline exceeded."); if (lane == VibeNetTransport.TCP) Close(DisconnectReason.Timeout); return SendResult.Failed; }
+            catch (Exception ex) { if (lane == VibeNetTransport.TCP) Fail(ex); else Node.Report(Id, FailureCode.Socket, "UDP send failed."); return SendResult.Failed; }
+            finally { lease.Dispose(); Interlocked.Decrement(ref sends); Interlocked.Decrement(ref Node.PendingSends); Exit(); }
+        }
+        private async Task Control(Kind type, byte[] data, CancellationToken ct, bool udp = false)
+        {
+            using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct, Stop.Token))
             {
+                deadline.CancelAfter(Node.Configuration.SendTimeout);
+                await Write(type, data, udp ? VibeNetTransport.UDP : VibeNetTransport.TCP, deadline.Token).ConfigureAwait(false);
             }
-
-            throw;
         }
-        finally
+        private async Task Write(Kind type, byte[] data, VibeNetTransport lane, CancellationToken token)
         {
-            tcpSendLock.Release();
-        }
-    }
-
-    private async Task SendUdpFrameAsync(
-        VibeNetPacketType type,
-        byte[] payload,
-        CancellationToken cancellationToken)
-    {
-        UdpClient udp = udpSocket ?? throw new ObjectDisposedException(nameof(VibeNetClient));
-        byte[] datagram = VibeNetProtocol.CreateUdpFrame(type, payload);
-
-        await udpSendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            await VibeNetSocket.SendConnectedAsync(udp, datagram, cancellationToken).ConfigureAwait(false);
-        }
-        finally
-        {
-            udpSendLock.Release();
-        }
-    }
-
-    private Task BeginShutdownAsync(
-        VibeNetDisconnectReason reason,
-        string detail,
-        bool publishEvent,
-        bool notifyRemote)
-    {
-        lock (stateLock)
-        {
-            if (shutdownTask != null)
-                return shutdownTask;
-
-            shutdownStarted = true;
-            shutdownTask = ShutdownCoreAsync(reason, detail, publishEvent, notifyRemote);
-            return shutdownTask;
-        }
-    }
-
-    private async Task ShutdownCoreAsync(
-        VibeNetDisconnectReason reason,
-        string detail,
-        bool publishEvent,
-        bool notifyRemote)
-    {
-        bool shouldPublish;
-        Guid currentId;
-
-        lock (stateLock)
-        {
-            currentId = connectionId;
-            if (connectionEstablished)
-                lastDisconnectReason = reason;
-
-            if (state == VibeNetConnectionState.Connected ||
-                state == VibeNetConnectionState.Connecting)
-            {
-                state = VibeNetConnectionState.Disconnecting;
-            }
-
-            shouldPublish = publishEvent && connectionEstablished;
-        }
-
-        if (notifyRemote && connectionEstablished)
-            await TrySendDisconnectControlFrameAsync(currentId).ConfigureAwait(false);
-
-        Lifetime.Cancel();
-        CloseClientSockets();
-
-        VibeNetConnectionState finalState =
-            IsFault(reason)
-            ? VibeNetConnectionState.Faulted
-            : VibeNetConnectionState.Disconnected;
-
-        VibeNetConnectionInfo finalConnection;
-        lock (stateLock)
-        {
-            state = finalState;
-            finalConnection = MakeConnectionInfoLocked(finalState);
-        }
-
-        if (shouldPublish)
-            PublishDisconnectEvent(finalConnection, reason, detail);
-    }
-
-    private async Task AwaitBackgroundTasksAsync()
-    {
-        try
-        {
-            await Task.WhenAll(tcpTask, udpTask, heartbeatTask).ConfigureAwait(false);
-        }
-        catch
-        {
-        }
-    }
-
-    private void AbortStart()
-    {
-        CloseClientSockets();
-        Lifetime.Cancel();
-
-        lock (stateLock)
-            state = VibeNetConnectionState.Disconnected;
-    }
-
-    private VibeNetConnectionInfo MakeConnectionInfo()
-    {
-        lock (stateLock)
-            return MakeConnectionInfoLocked(state);
-    }
-
-    private VibeNetConnectionInfo MakeConnectionInfoLocked(VibeNetConnectionState snapshotState)
-    {
-        DateTime lastActivity = lastActivityUtcTicks == 0
-            ? DateTime.MinValue
-            : new DateTime(lastActivityUtcTicks, DateTimeKind.Utc);
-
-        return new VibeNetConnectionInfo(
-            connectionId,
-            remoteAddress,
-            tcpRemotePort,
-            udpRemotePort,
-            snapshotState,
-            tcpConnectedAtUtc,
-            connectedAtUtc,
-            lastActivity);
-    }
-
-    private async Task TrySendDisconnectControlFrameAsync(Guid currentId)
-    {
-        using CancellationTokenSource timeout = VibeNetCancellation.CreateTimeoutSource(
-            VibeNetDefaults.ControlFrameTimeout);
-
-        try
-        {
-            await SendTcpFrameAsync(
-                VibeNetPacketType.Disconnect,
-                VibeNetProtocol.CreateDisconnectPayload(VibeNetDisconnectCode.ClientRequested),
-                timeout.Token).ConfigureAwait(false);
-        }
-        catch (Exception ex) when (IsControlSendException(ex))
-        {
-            ReportFailure(
-                VibeNetFailureCode.SendFailure,
-                VibeNetOperation.Disconnect,
-                "Failed to send disconnect control frame.",
-                currentId,
-                VibeNetTransport.TCP,
-                ex);
-        }
-    }
-
-    private void PublishDisconnectEvent(
-        VibeNetConnectionInfo connection,
-        VibeNetDisconnectReason reason,
-        string detail)
-    {
-        disconnectedQueue.TryEnqueue(
-            new VibeNetDisconnectInfo(
-                connection,
-                reason,
-                detail,
-                DateTime.UtcNow));
-    }
-
-    private static string GetConnectTimeoutMessage(VibeNetOperation operation)
-    {
-        switch (operation)
-        {
-            case VibeNetOperation.UdpHandshake:
-                return "UDP registration acknowledgement was not received.";
-            case VibeNetOperation.ReadyHandshake:
-                return "READY acknowledgement was not received.";
-            default:
-                return "Connection attempt timed out.";
-        }
-    }
-
-    private static VibeNetTransport? GetFailureTransport(VibeNetOperation operation)
-    {
-        switch (operation)
-        {
-            case VibeNetOperation.TcpConnect:
-            case VibeNetOperation.HelloHandshake:
-            case VibeNetOperation.ReadyHandshake:
-            case VibeNetOperation.TcpSend:
-            case VibeNetOperation.TcpReceive:
-            case VibeNetOperation.Heartbeat:
-            case VibeNetOperation.Disconnect:
-                return VibeNetTransport.TCP;
-            case VibeNetOperation.UdpHandshake:
-            case VibeNetOperation.UdpSend:
-            case VibeNetOperation.UdpReceive:
-                return VibeNetTransport.UDP;
-            default:
-                return null;
-        }
-    }
-
-    private VibeNetConnectResult FailStart(
-        VibeNetFailureCode failure,
-        VibeNetOperation operation,
-        string detail,
-        Exception? exception = null)
-    {
-        CloseClientSockets();
-        Lifetime.Cancel();
-
-        lock (stateLock)
-        {
-            state =
-                failure == VibeNetFailureCode.Aborted
-                ? VibeNetConnectionState.Disconnected
-                : VibeNetConnectionState.Faulted;
-        }
-
-        Guid? failedConnectionId = connectionId == Guid.Empty ? (Guid?)null : connectionId;
-
-        return VibeNetConnectResult.Failed(
-            new VibeNetFailure(
-                failedConnectionId,
-                GetFailureTransport(operation),
-                failure,
-                operation,
-                detail,
-                exception,
-                DateTime.UtcNow));
-    }
-
-    private void CloseClientSockets()
-    {
-        try
-        {
-            udpSocket?.Close();
-        }
-        catch
-        {
-        }
-
-        try
-        {
-            tcpClient?.Close();
-        }
-        catch
-        {
-        }
-    }
-
-    private void TouchTcp()
-    {
-        Interlocked.Exchange(ref lastTcpActivityStamp, VibeNetTime.Timestamp);
-        TouchActivity();
-    }
-
-    private void TouchActivity()
-    {
-        long now = DateTime.UtcNow.Ticks;
-        Interlocked.Exchange(ref lastActivityUtcTicks, now);
-    }
-
-    private static bool IsFault(VibeNetDisconnectReason reason)
-    {
-        return reason == VibeNetDisconnectReason.Timeout ||
-               reason == VibeNetDisconnectReason.ConnectionLost ||
-               reason == VibeNetDisconnectReason.ProtocolError ||
-               reason == VibeNetDisconnectReason.ResourceLimit;
-    }
-
-    private static IPAddress? NormalizeDisplayAddress(IPAddress? address)
-    {
-        if (address != null && address.IsIPv4MappedToIPv6)
-            return address.MapToIPv4();
-
-        return address;
-    }
-}
-
-internal enum VibeNetPacketType : byte
-{
-    Hello = 1,
-    Reject = 2,
-    UdpRegister = 3,
-    UdpAck = 4,
-    Ready = 5,
-    ReadyAck = 6,
-    Data = 7,
-    Ping = 8,
-    Pong = 9,
-    Disconnect = 10
-}
-
-internal enum VibeNetDisconnectCode : byte
-{
-    ClientRequested = 1,
-    ServerRequested = 2,
-    ServerStopping = 3
-}
-
-internal sealed class NetworkFrame
-{
-    public VibeNetPacketType Type { get; }
-    public byte[] Payload { get; }
-
-    public NetworkFrame(VibeNetPacketType type, byte[] payload)
-    {
-        Type = type;
-        Payload = payload;
-    }
-}
-
-internal sealed class VibeNetProtocolException : Exception
-{
-    public bool ProtocolMismatch { get; }
-
-    public VibeNetProtocolException(string message, bool protocolMismatch = false)
-        : base(message)
-    {
-        ProtocolMismatch = protocolMismatch;
-    }
-}
-
-internal sealed class VibeNetDisconnectSignal : Exception
-{
-    public VibeNetDisconnectReason Reason { get; }
-    public string Detail { get; }
-
-    public VibeNetDisconnectSignal(VibeNetDisconnectReason reason, string detail)
-    {
-        Reason = reason;
-        Detail = detail;
-    }
-}
-
-internal static class VibeNetProtocol
-{
-    public const int HeaderSize = 12;
-    public const ushort Version = 1;
-    public const int SessionTokenSize = 32;
-    public const int MaxControlPayloadBytes = 1024;
-    public const int MaxUserUdpPayloadBytes = 65507 - HeaderSize;
-
-    private const uint Magic = 0x56494245; // "VIBE"
-
-    public static readonly byte[] EmptyPayload = Array.Empty<byte>();
-
-    public static async Task WriteTcpFrameAsync(
-        NetworkStream stream,
-        VibeNetPacketType type,
-        byte[] payload,
-        CancellationToken cancellationToken)
-    {
-        if (stream == null)
-            throw new ArgumentNullException(nameof(stream));
-
-        payload ??= EmptyPayload;
-        byte[] header = CreateHeader(type, payload.Length);
-
-        await stream.WriteAsync(header, 0, header.Length, cancellationToken).ConfigureAwait(false);
-
-        if (payload.Length > 0)
-            await stream.WriteAsync(payload, 0, payload.Length, cancellationToken).ConfigureAwait(false);
-    }
-
-    public static async Task<NetworkFrame?> ReadTcpFrameAsync(
-        NetworkStream stream,
-        int maximumPayloadBytes,
-        CancellationToken cancellationToken)
-    {
-        byte[] header = new byte[HeaderSize];
-        bool hasHeader = await ReadExactAsync(
-            stream,
-            header,
-            0,
-            header.Length,
-            true,
-            cancellationToken).ConfigureAwait(false);
-
-        if (!hasHeader)
-            return null;
-
-        ParseHeader(header, maximumPayloadBytes, out VibeNetPacketType type, out int payloadLength);
-
-        byte[] payload = payloadLength == 0 ? EmptyPayload : new byte[payloadLength];
-        if (payloadLength > 0)
-        {
-            await ReadExactAsync(
-                stream,
-                payload,
-                0,
-                payload.Length,
-                false,
-                cancellationToken).ConfigureAwait(false);
-        }
-
-        return new NetworkFrame(type, payload);
-    }
-
-    public static byte[] CreateUdpFrame(VibeNetPacketType type, byte[] payload)
-    {
-        payload ??= EmptyPayload;
-        byte[] frame = new byte[HeaderSize + payload.Length];
-        byte[] header = CreateHeader(type, payload.Length);
-        Buffer.BlockCopy(header, 0, frame, 0, HeaderSize);
-
-        if (payload.Length > 0)
-            Buffer.BlockCopy(payload, 0, frame, HeaderSize, payload.Length);
-
-        return frame;
-    }
-
-    public static bool TryParseUdpFrame(
-        byte[] datagram,
-        int maximumPayloadBytes,
-        out NetworkFrame? frame)
-    {
-        frame = null;
-
-        if (datagram == null || datagram.Length < HeaderSize)
-            return false;
-
-        byte[] header = new byte[HeaderSize];
-        Buffer.BlockCopy(datagram, 0, header, 0, HeaderSize);
-
-        try
-        {
-            ParseHeader(header, maximumPayloadBytes, out VibeNetPacketType type, out int payloadLength);
-
-            if (datagram.Length != HeaderSize + payloadLength)
-                return false;
-
-            byte[] payload = payloadLength == 0 ? EmptyPayload : new byte[payloadLength];
-            if (payloadLength > 0)
-                Buffer.BlockCopy(datagram, HeaderSize, payload, 0, payloadLength);
-
-            frame = new NetworkFrame(type, payload);
-            return true;
-        }
-        catch (VibeNetProtocolException)
-        {
-            return false;
-        }
-    }
-
-    public static byte[] CreateHelloPayload(Guid connectionId, byte[] token)
-    {
-        if (token == null || token.Length != SessionTokenSize)
-            throw new ArgumentException("Invalid session token.", nameof(token));
-
-        byte[] payload = new byte[16 + SessionTokenSize];
-        byte[] idBytes = GuidToNetworkBytes(connectionId);
-        Buffer.BlockCopy(idBytes, 0, payload, 0, 16);
-        Buffer.BlockCopy(token, 0, payload, 16, SessionTokenSize);
-        return payload;
-    }
-
-    public static bool TryParseHelloPayload(byte[] payload, out Guid connectionId, out byte[]? token)
-    {
-        connectionId = Guid.Empty;
-        token = null;
-
-        if (payload == null || payload.Length != 16 + SessionTokenSize)
-            return false;
-
-        byte[] idBytes = new byte[16];
-        byte[] tokenBytes = new byte[SessionTokenSize];
-
-        Buffer.BlockCopy(payload, 0, idBytes, 0, 16);
-        Buffer.BlockCopy(payload, 16, tokenBytes, 0, SessionTokenSize);
-
-        connectionId = GuidFromNetworkBytes(idBytes);
-        token = tokenBytes;
-        return true;
-    }
-
-    public static byte[] CreateRegistrationPayload(Guid connectionId, byte[] token)
-    {
-        return CreateHelloPayload(connectionId, token);
-    }
-
-    public static bool TryParseRegistrationPayload(byte[] payload, out Guid connectionId, out byte[]? token)
-    {
-        return TryParseHelloPayload(payload, out connectionId, out token);
-    }
-
-    public static bool RegistrationAckMatches(byte[] payload, Guid expectedId)
-    {
-        return payload.Length == 16 && GuidFromNetworkBytes(payload) == expectedId;
-    }
-
-    public static byte[] CreateRejectPayload(string? reason)
-    {
-        byte[] bytes = Encoding.UTF8.GetBytes(reason ?? "Rejected.");
-        if (bytes.Length > MaxControlPayloadBytes)
-            Array.Resize(ref bytes, MaxControlPayloadBytes);
-
-        return bytes;
-    }
-
-    public static string ParseRejectPayload(byte[] payload)
-    {
-        return payload == null ? "Rejected." : Encoding.UTF8.GetString(payload);
-    }
-
-    public static byte[] CreateDisconnectPayload(VibeNetDisconnectCode code)
-    {
-        return new[] { (byte)code };
-    }
-
-    public static VibeNetDisconnectCode ParseDisconnectPayload(byte[] payload)
-    {
-        if (payload == null || payload.Length != 1)
-            throw new VibeNetProtocolException("Invalid DISCONNECT payload.");
-
-        VibeNetDisconnectCode code = (VibeNetDisconnectCode)payload[0];
-        if (code != VibeNetDisconnectCode.ClientRequested &&
-            code != VibeNetDisconnectCode.ServerRequested &&
-            code != VibeNetDisconnectCode.ServerStopping)
-        {
-            throw new VibeNetProtocolException("Unknown DISCONNECT code.");
-        }
-
-        return code;
-    }
-
-    public static void RequireEmptyPayload(NetworkFrame frame)
-    {
-        if (frame.Payload.Length != 0)
-            throw new VibeNetProtocolException(frame.Type + " packets must not carry a payload.");
-    }
-
-    public static byte[] GuidToNetworkBytes(Guid value)
-    {
-        string text = value.ToString("N");
-        byte[] bytes = new byte[16];
-        for (int index = 0; index < 16; index++)
-            bytes[index] = Convert.ToByte(text.Substring(index * 2, 2), 16);
-
-        return bytes;
-    }
-
-    public static Guid GuidFromNetworkBytes(byte[] bytes)
-    {
-        if (bytes == null || bytes.Length != 16)
-            throw new ArgumentException("A network Guid requires exactly 16 bytes.", nameof(bytes));
-
-        StringBuilder builder = new StringBuilder(32);
-        for (int index = 0; index < bytes.Length; index++)
-            builder.Append(bytes[index].ToString("x2"));
-
-        return Guid.ParseExact(builder.ToString(), "N");
-    }
-
-    private static byte[] CreateHeader(VibeNetPacketType type, int payloadLength)
-    {
-        if (payloadLength < 0)
-            throw new ArgumentOutOfRangeException(nameof(payloadLength));
-
-        byte[] header = new byte[HeaderSize];
-        WriteUInt32(header, 0, Magic);
-        WriteUInt16(header, 4, Version);
-        header[6] = (byte)type;
-        header[7] = 0;
-        WriteUInt32(header, 8, (uint)payloadLength);
-        return header;
-    }
-
-    private static void ParseHeader(
-        byte[] header,
-        int maximumPayloadBytes,
-        out VibeNetPacketType type,
-        out int payloadLength)
-    {
-        if (ReadUInt32(header, 0) != Magic)
-            throw new VibeNetProtocolException("Protocol magic mismatch.", true);
-
-        ushort version = ReadUInt16(header, 4);
-        if (version != Version)
-        {
-            throw new VibeNetProtocolException(
-                "Unsupported protocol version " + version + "; expected " + Version + ".",
-                true);
-        }
-
-        if (header[7] != 0)
-            throw new VibeNetProtocolException("Reserved protocol header bits must be zero.");
-
-        byte rawType = header[6];
-        if (!Enum.IsDefined(typeof(VibeNetPacketType), rawType))
-            throw new VibeNetProtocolException("Unknown packet type " + rawType + ".");
-
-        uint rawPayloadLength = ReadUInt32(header, 8);
-        if (rawPayloadLength > int.MaxValue || rawPayloadLength > maximumPayloadBytes)
-            throw new VibeNetProtocolException("Frame payload exceeds the configured maximum.");
-
-        type = (VibeNetPacketType)rawType;
-        payloadLength = (int)rawPayloadLength;
-    }
-
-    private static async Task<bool> ReadExactAsync(
-        Stream stream,
-        byte[] buffer,
-        int offset,
-        int count,
-        bool allowCleanEndOfStream,
-        CancellationToken cancellationToken)
-    {
-        int total = 0;
-        while (total < count)
-        {
-            int read = await stream.ReadAsync(
-                buffer,
-                offset + total,
-                count - total,
-                cancellationToken).ConfigureAwait(false);
-
-            if (read == 0)
-            {
-                if (total == 0 && allowCleanEndOfStream)
-                    return false;
-
-                throw new EndOfStreamException("Connection closed in the middle of a frame.");
-            }
-
-            total += read;
-        }
-
-        return true;
-    }
-
-    private static void WriteUInt16(byte[] buffer, int offset, ushort value)
-    {
-        buffer[offset] = (byte)(value >> 8);
-        buffer[offset + 1] = (byte)value;
-    }
-
-    private static ushort ReadUInt16(byte[] buffer, int offset)
-    {
-        return (ushort)((buffer[offset] << 8) | buffer[offset + 1]);
-    }
-
-    private static void WriteUInt32(byte[] buffer, int offset, uint value)
-    {
-        buffer[offset] = (byte)(value >> 24);
-        buffer[offset + 1] = (byte)(value >> 16);
-        buffer[offset + 2] = (byte)(value >> 8);
-        buffer[offset + 3] = (byte)value;
-    }
-
-    private static uint ReadUInt32(byte[] buffer, int offset)
-    {
-        return ((uint)buffer[offset] << 24) |
-               ((uint)buffer[offset + 1] << 16) |
-               ((uint)buffer[offset + 2] << 8) |
-               buffer[offset + 3];
-    }
-}
-
-internal enum BoundedQueueOverflowMode
-{
-    RejectNew,
-    DropOldest
-}
-
-internal sealed class BoundedQueue<T>
-{
-    private readonly object sync = new object();
-    private readonly Queue<T> queue = new Queue<T>();
-    private readonly int capacity;
-    private readonly BoundedQueueOverflowMode overflowMode;
-
-    public BoundedQueue(
-        int capacity,
-        BoundedQueueOverflowMode overflowMode = BoundedQueueOverflowMode.RejectNew)
-    {
-        if (capacity <= 0)
-            throw new ArgumentOutOfRangeException(nameof(capacity));
-
-        this.capacity = capacity;
-        this.overflowMode = overflowMode;
-    }
-
-    public bool TryEnqueue(T item)
-    {
-        lock (sync)
-        {
-            if (overflowMode == BoundedQueueOverflowMode.RejectNew)
-            {
-                if (queue.Count >= capacity)
-                    return false;
-            }
-            else
-            {
-                while (queue.Count >= capacity)
-                    queue.Dequeue();
-            }
-
-            queue.Enqueue(item);
-            return true;
-        }
-    }
-
-    public bool TryDequeue(out T item)
-    {
-        lock (sync)
-        {
-            if (queue.Count == 0)
-            {
-                item = default!;
-                return false;
-            }
-
-            item = queue.Dequeue();
-            return true;
-        }
-    }
-}
-
-internal enum ServerQueueEnqueueKind
-{
-    Enqueued,
-    Dropped,
-    DisconnectCurrent
-}
-
-internal readonly struct ServerQueueEnqueueResult
-{
-    public ServerQueueEnqueueKind Kind { get; }
-
-    public ServerQueueEnqueueResult(ServerQueueEnqueueKind kind)
-    {
-        Kind = kind;
-    }
-}
-
-internal sealed class ServerMessageQueue
-{
-    private readonly struct OwnedMessage
-    {
-        public Guid OwnerId { get; }
-        public VibeNetMessage Message { get; }
-        public bool Reliable { get; }
-
-        public OwnedMessage(Guid ownerId, VibeNetMessage message, bool reliable)
-        {
-            OwnerId = ownerId;
-            Message = message;
-            Reliable = reliable;
-        }
-    }
-
-    private readonly object sync = new object();
-    private readonly int perOwnerReliableCapacity;
-    private readonly int totalCapacity;
-    private readonly Dictionary<Guid, int> countsByOwner =
-        new Dictionary<Guid, int>();
-    private readonly Dictionary<Guid, int> reliableCountsByOwner =
-        new Dictionary<Guid, int>();
-    private Queue<OwnedMessage> queue = new Queue<OwnedMessage>();
-
-    public ServerMessageQueue(int totalCapacity, int maxClients)
-    {
-        if (totalCapacity <= 0)
-            throw new ArgumentOutOfRangeException(nameof(totalCapacity));
-        if (maxClients <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maxClients));
-
-        this.totalCapacity = totalCapacity;
-        perOwnerReliableCapacity = Math.Max(1, totalCapacity / Math.Max(1, Math.Min(totalCapacity, maxClients)));
-    }
-
-    public ServerQueueEnqueueResult Enqueue(Guid ownerId, VibeNetMessage message, bool reliable)
-    {
-        lock (sync)
-        {
-            int ownerReliableCount =
-                reliableCountsByOwner.TryGetValue(ownerId, out int count) ? count : 0;
-
-            if (reliable && ownerReliableCount >= perOwnerReliableCapacity)
-                return new ServerQueueEnqueueResult(ServerQueueEnqueueKind.DisconnectCurrent);
-
-            if (queue.Count >= totalCapacity)
-            {
-                if (!reliable)
-                    return new ServerQueueEnqueueResult(ServerQueueEnqueueKind.Dropped);
-
-                if (!TryDropFirstUnreliableUnlocked())
-                    return new ServerQueueEnqueueResult(ServerQueueEnqueueKind.DisconnectCurrent);
-            }
-
-            EnqueueUnlocked(ownerId, message, reliable);
-            return new ServerQueueEnqueueResult(ServerQueueEnqueueKind.Enqueued);
-        }
-    }
-
-    public bool TryDequeue(out VibeNetMessage message)
-    {
-        lock (sync)
-        {
-            if (queue.Count == 0)
-            {
-                message = default!;
-                return false;
-            }
-
-            OwnedMessage ownedMessage = queue.Dequeue();
-            DecrementCountsUnlocked(ownedMessage.OwnerId, ownedMessage.Reliable);
-            message = ownedMessage.Message;
-            return true;
-        }
-    }
-
-    public void RemoveOwner(Guid ownerId)
-    {
-        lock (sync)
-            RemoveOwnerUnlocked(ownerId);
-    }
-
-    private void EnqueueUnlocked(Guid ownerId, VibeNetMessage message, bool reliable)
-    {
-        queue.Enqueue(new OwnedMessage(ownerId, message, reliable));
-        countsByOwner[ownerId] = countsByOwner.TryGetValue(ownerId, out int count) ? count + 1 : 1;
-        if (reliable)
-            reliableCountsByOwner[ownerId] = reliableCountsByOwner.TryGetValue(ownerId, out int reliableCount)
-                ? reliableCount + 1
-                : 1;
-    }
-
-    private void RemoveOwnerUnlocked(Guid ownerId)
-    {
-        if (!countsByOwner.ContainsKey(ownerId))
-            return;
-
-        Queue<OwnedMessage> rebuilt = new Queue<OwnedMessage>(queue.Count);
-        while (queue.Count > 0)
-        {
-            OwnedMessage ownedMessage = queue.Dequeue();
-            if (ownedMessage.OwnerId == ownerId)
-            {
-                DecrementCountsUnlocked(ownedMessage.OwnerId, ownedMessage.Reliable);
-                continue;
-            }
-
-            rebuilt.Enqueue(ownedMessage);
-        }
-
-        queue = rebuilt;
-    }
-
-    private bool TryDropFirstUnreliableUnlocked()
-    {
-        Queue<OwnedMessage> rebuilt = new Queue<OwnedMessage>(queue.Count);
-        bool dropped = false;
-        while (queue.Count > 0)
-        {
-            OwnedMessage ownedMessage = queue.Dequeue();
-            if (!dropped && !ownedMessage.Reliable)
-            {
-                DecrementCountsUnlocked(ownedMessage.OwnerId, false);
-                dropped = true;
-                continue;
-            }
-
-            rebuilt.Enqueue(ownedMessage);
-        }
-
-        queue = rebuilt;
-        return dropped;
-    }
-
-    private void DecrementCountsUnlocked(Guid ownerId, bool reliable)
-    {
-        if (countsByOwner.TryGetValue(ownerId, out int count))
-        {
-            if (count <= 1)
-                countsByOwner.Remove(ownerId);
-            else
-                countsByOwner[ownerId] = count - 1;
-        }
-
-        if (!reliable)
-            return;
-
-        if (reliableCountsByOwner.TryGetValue(ownerId, out int reliableCount))
-        {
-            if (reliableCount <= 1)
-                reliableCountsByOwner.Remove(ownerId);
-            else
-                reliableCountsByOwner[ownerId] = reliableCount - 1;
-        }
-    }
-}
-
-internal static class VibeNetTime
-{
-    public static long Timestamp => Stopwatch.GetTimestamp();
-
-    public static bool HasElapsed(long timestamp, TimeSpan duration)
-    {
-        long elapsed = Stopwatch.GetTimestamp() - timestamp;
-        return elapsed >= ToStopwatchTicks(duration);
-    }
-
-    public static long ToStopwatchTicks(TimeSpan duration)
-    {
-        double ticks = duration.TotalSeconds * Stopwatch.Frequency;
-        return (long)Math.Ceiling(ticks);
-    }
-
-    public static TimeSpan Remaining(long deadlineTimestamp)
-    {
-        long remaining = deadlineTimestamp - Stopwatch.GetTimestamp();
-        if (remaining <= 0)
-            return TimeSpan.Zero;
-
-        double seconds = (double)remaining / Stopwatch.Frequency;
-        return TimeSpan.FromSeconds(seconds);
-    }
-}
-
-internal static class VibeNetTask
-{
-    public static async Task WaitAsync(Task task, CancellationToken cancellationToken)
-    {
-        if (!cancellationToken.CanBeCanceled)
-        {
-            await task.ConfigureAwait(false);
-            return;
-        }
-
-        Task completedTask = await Task.WhenAny(
-            task,
-            Task.Delay(Timeout.Infinite, cancellationToken)).ConfigureAwait(false);
-
-        if (!ReferenceEquals(completedTask, task))
-            throw new OperationCanceledException(cancellationToken);
-
-        await task.ConfigureAwait(false);
-    }
-
-    public static async Task<T> WaitAsync<T>(Task<T> task, CancellationToken cancellationToken)
-    {
-        if (!cancellationToken.CanBeCanceled)
-            return await task.ConfigureAwait(false);
-
-        Task completedTask = await Task.WhenAny(
-            task,
-            Task.Delay(Timeout.Infinite, cancellationToken)).ConfigureAwait(false);
-
-        if (!ReferenceEquals(completedTask, task))
-            throw new OperationCanceledException(cancellationToken);
-
-        return await task.ConfigureAwait(false);
-    }
-
-    public static void Observe(Task task)
-    {
-        task.ContinueWith(
-            observedTask =>
-            {
-                _ = observedTask.Exception;
-            },
-            CancellationToken.None,
-            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
-            TaskScheduler.Default);
-    }
-}
-
-internal static class VibeNetSocket
-{
-    public static async Task<TcpClient> AcceptTcpClientAsync(
-        TcpListener listener,
-        CancellationToken cancellationToken)
-    {
-        Task<TcpClient> acceptTask = listener.AcceptTcpClientAsync();
-
-        try
-        {
-            return await VibeNetTask.WaitAsync(acceptTask, cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            VibeNetTask.Observe(acceptTask);
-            throw;
-        }
-    }
-
-    public static async Task ConnectAsync(
-        TcpClient client,
-        IPAddress address,
-        int port,
-        CancellationToken cancellationToken)
-    {
-        Task connectTask = client.ConnectAsync(address, port);
-
-        try
-        {
-            await VibeNetTask.WaitAsync(connectTask, cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            VibeNetTask.Observe(connectTask);
+            var gate = lane == VibeNetTransport.TCP ? tcpSend : udpSend;
+            await gate.WaitAsync(token).ConfigureAwait(false);
+            bool wrote = false;
             try
             {
-                client.Close();
+                if (lane == VibeNetTransport.TCP)
+                {
+                    if (tcpTx!.NeedsUpdate)
+                    {
+                        wrote = true;
+                        await LowTcp(Kind.TcpUpdate, Array.Empty<byte>(), token).ConfigureAwait(false);
+                        var n = tcpTx.Next();
+                        tcpTx.Dispose();
+                        tcpTx = n;
+                    }
+                    wrote = true;
+                    await LowTcp(type, data, token).ConfigureAwait(false);
+                }
+                else
+                {
+                    if (udpTx!.NeedsUpdate)
+                    {
+                        byte[] e = new byte[4];
+                        TaskCompletionSource<bool> ack;
+                        lock (receiveGate)
+                        {
+                            expectedAck = checked(udpTx.Epoch + 1);
+                            Wire.U32(e, 0, expectedAck);
+                            ack = updateAck = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        }
+                        try
+                        {
+                            await Control(Kind.UdpUpdate, e, token).ConfigureAwait(false);
+                            await Wire.Wait(ack.Task, token).ConfigureAwait(false);
+                            var n = udpTx.Next();
+                            udpTx.Dispose();
+                            udpTx = n;
+                        }
+                        catch { Close(DisconnectReason.ConnectionLost); throw; }
+                        finally { lock (receiveGate) updateAck = null; }
+                    }
+                    token.ThrowIfCancellationRequested();
+                    var endpoint = UdpEndpoint ?? throw new ProtocolException("No registered UDP endpoint.");
+                    byte[] b = udpTx.Seal(Id, type, lane, data);
+                    // Old Unity UdpClient has no cancellation overload. Await completion; only private ciphertext is retained.
+                    await Node.SendDatagram(b, endpoint).ConfigureAwait(false);
+                    token.ThrowIfCancellationRequested();
+                }
             }
-            catch
+            catch (OperationCanceledException) { if (wrote) Close(DisconnectReason.ConnectionLost); throw; }
+            finally { gate.Release(); }
+        }
+        private async Task LowTcp(Kind kind, byte[] data, CancellationToken ct)
+        {
+            byte[] b = tcpTx!.Seal(Id, kind, VibeNetTransport.TCP, data);
+            await Stream.WriteAsync(b, 0, b.Length, ct).ConfigureAwait(false);
+        }
+        internal async Task Heartbeat()
+        {
+            if (State != ConnectionState.Connected || !Enter())
+                return;
+            try
             {
+                if (Clock.Elapsed(Interlocked.Read(ref lastTcp), Node.Configuration.IdleTimeout))
+                {
+                    Close(DisconnectReason.Timeout);
+                    return;
+                }
+                lock (receiveGate)
+                {
+                    if (previousUdp != null && Clock.Now >= previousUntil)
+                    {
+                        previousUdp.Dispose();
+                        previousUdp = null;
+                    }
+                }
+                if (server)
+                    await Control(Kind.Ping, Array.Empty<byte>(), Stop.Token).ConfigureAwait(false);
             }
-
-            throw;
+            catch (Exception ex) { Fail(ex); }
+            finally { Exit(); }
+        }
+        internal async Task Disconnect(DisconnectReason reason)
+        {
+            if (!Enter())
+                return;
+            try
+            {
+                if (State == ConnectionState.Connected)
+                {
+                    lock (lifeGate)
+                    {
+                        requestedClose = reason;
+                        if (closed == 0)
+                            Volatile.Write(ref state, (int)ConnectionState.Closing);
+                    }
+                    try
+                    {
+                        using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(Stop.Token))
+                        {
+                            timeout.CancelAfter(Node.Configuration.SendTimeout);
+                            await Control(Kind.Bye, new[] { reason == DisconnectReason.ServerStopped ? (byte)1 : (byte)0 }, timeout.Token).ConfigureAwait(false);
+                            await Wire.Wait(byeAck.Task, timeout.Token).ConfigureAwait(false);
+                        }
+                    }
+                    catch { }
+                }
+            }
+            finally { Close(reason); Exit(); }
+        }
+        internal void Fail(Exception ex)
+        {
+            if (State == ConnectionState.Closed)
+                return;
+            var reason = ex is ResourceException ? DisconnectReason.ResourceLimit : ex is ProtocolException || ex is CryptographicException ? DisconnectReason.ProtocolError : DisconnectReason.ConnectionLost;
+            Node.Report(Id, ex is ResourceException ? FailureCode.ResourceLimit : ex is CryptographicException ? FailureCode.Integrity : ex is ProtocolException ? FailureCode.Protocol : FailureCode.Socket, ex is CryptographicException ? "Record integrity failure." : ex.Message);
+            Close(reason);
         }
     }
-
-    public static async Task<IPAddress[]> GetHostAddressesAsync(
-        string host,
-        CancellationToken cancellationToken)
+    internal sealed class ResourceException : IOException
     {
-        Task<IPAddress[]> lookupTask = Dns.GetHostAddressesAsync(host);
-
-        try
-        {
-            return await VibeNetTask.WaitAsync(lookupTask, cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            VibeNetTask.Observe(lookupTask);
-            throw;
-        }
+        internal ResourceException() : base("Resource admission limit exceeded.") { }
     }
-
-    public static async Task<UdpReceiveResult> ReceiveAsync(
-        UdpClient udp,
-        CancellationToken cancellationToken)
+    internal sealed class DeadlineQueue
     {
-        Task<UdpReceiveResult> receiveTask = udp.ReceiveAsync();
-
-        try
+        private readonly List<Link> heap = new List<Link>();
+        internal Link? Due(long now) => heap.Count != 0 && heap[0].NextHeartbeat <= now ? heap[0] : null;
+        internal void Add(Link c)
         {
-            return await VibeNetTask.WaitAsync(receiveTask, cancellationToken).ConfigureAwait(false);
+            c.HeapIndex = heap.Count;
+            heap.Add(c);
+            Up(c.HeapIndex);
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        internal void Remove(Link c)
         {
-            VibeNetTask.Observe(receiveTask);
-            throw;
+            int i = c.HeapIndex;
+            if (i < 0)
+                return;
+            int last = heap.Count - 1;
+            var other = heap[last];
+            heap.RemoveAt(last);
+            c.HeapIndex = -1;
+            if (i == last)
+                return;
+            heap[i] = other;
+            other.HeapIndex = i;
+            if (i > 0 && heap[i].NextHeartbeat < heap[(i - 1) / 2].NextHeartbeat)
+                Up(i);
+            else
+                Down(i);
         }
-    }
-
-    public static async Task<int> SendAsync(
-        UdpClient udp,
-        byte[] datagram,
-        IPEndPoint endpoint,
-        CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        Task<int> sendTask = udp.SendAsync(datagram, datagram.Length, endpoint);
-
-        try
+        private void Swap(int a, int b)
         {
-            return await VibeNetTask.WaitAsync(sendTask, cancellationToken).ConfigureAwait(false);
+            var t = heap[a];
+            heap[a] = heap[b];
+            heap[b] = t;
+            heap[a].HeapIndex = a;
+            heap[b].HeapIndex = b;
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        private void Up(int i)
         {
-            VibeNetTask.Observe(sendTask);
-            throw;
+            while (i > 0)
+            {
+                int p = (i - 1) / 2;
+                if (heap[p].NextHeartbeat <= heap[i].NextHeartbeat)
+                    break;
+                Swap(p, i);
+                i = p;
+            }
         }
-    }
-
-    public static async Task<int> SendConnectedAsync(
-        UdpClient udp,
-        byte[] datagram,
-        CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        Task<int> sendTask = udp.SendAsync(datagram, datagram.Length);
-
-        try
+        private void Down(int i)
         {
-            return await VibeNetTask.WaitAsync(sendTask, cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            VibeNetTask.Observe(sendTask);
-            throw;
+            while (true)
+            {
+                int a = i * 2 + 1;
+                if (a >= heap.Count)
+                    return;
+                int b = a + 1;
+                if (b < heap.Count && heap[b].NextHeartbeat < heap[a].NextHeartbeat)
+                    a = b;
+                if (heap[i].NextHeartbeat <= heap[a].NextHeartbeat)
+                    return;
+                Swap(i, a);
+                i = a;
+            }
         }
     }
 }
-
-internal static class VibeNetDefaults
+namespace VibeNet
 {
-    public static readonly TimeSpan ControlFrameTimeout = TimeSpan.FromSeconds(2);
+    public sealed class VibeNetServer : VibeNetNode
+    {
+        public int TcpPort
+        {
+            get;
+        }
+        public int UdpPort
+        {
+            get;
+        }
+        public IPAddress BindAddress
+        {
+            get;
+        }
+        private readonly object gate = new object(); private readonly Dictionary<Guid, Link> links = new Dictionary<Guid, Link>();
+        private readonly HashSet<Guid> connected = new HashSet<Guid>(); private readonly HashSet<Task> workers = new HashSet<Task>();
+        private readonly Ring<ConnectionInfo> connects;
+        private readonly DeadlineQueue deadlines = new DeadlineQueue();
+        private TcpListener? listener; private UdpClient? udp; private Task accepting = Task.CompletedTask, receiving = Task.CompletedTask, heartbeat = Task.CompletedTask;
+        private Task? stopping; private int attempted, stoppingFlag, heartbeatWork, broadcasts;
+        private readonly RateGate attempts;
+        private readonly Dictionary<IPAddress, AddressRate> sources = new Dictionary<IPAddress, AddressRate>();
+        private readonly Queue<IPAddress> sourceOrder = new Queue<IPAddress>();
+        private sealed class AddressRate
+        {
+            internal readonly RateGate Rate; internal long Stamp; internal AddressRate(int max)
+            {
+                Rate = new RateGate(max, max);
+                Stamp = Clock.Now;
+            }
+        }
+        public int ConnectedClientCount
+        {
+            get
+            {
+                lock (gate)
+                    return connected.Count;
+            }
+        }
+        public int PendingClientCount
+        {
+            get
+            {
+                lock (gate)
+                    return links.Count - connected.Count;
+            }
+        }
+        public bool IsRunning => Volatile.Read(ref attempted) != 0 && Volatile.Read(ref stoppingFlag) == 0 && listener != null;
+        internal override long EventLoss => Interlocked.Read(ref connects.Lost) + Interlocked.Read(ref Disconnects.Lost) + Interlocked.Read(ref Failures.Lost);
+        public IReadOnlyList<ConnectionInfo> Connections
+        {
+            get
+            {
+                var a = Snapshot();
+                var b = new ConnectionInfo[a.Length];
+                for (int i = 0; i < a.Length; i++)
+                    b[i] = new ConnectionInfo(a[i]);
+                return b;
+            }
+        }
+        public VibeNetServer(int tcpPort = 7777, int? udpPort = null, IPAddress? bindAddress = null, VibeNetConfiguration? configuration = null) : base(configuration)
+        {
+            Port(tcpPort);
+            Port(udpPort ?? tcpPort);
+            TcpPort = tcpPort;
+            UdpPort = udpPort ?? tcpPort;
+            BindAddress = bindAddress ?? IPAddress.Any;
+            connects = new Ring<ConnectionInfo>(Configuration.MaxEvents);
+            attempts = new RateGate(Configuration.MaxConnectionAttemptsPerSecond, Configuration.MaxConnectionAttemptsPerSecond);
+        }
+        public bool TryDequeueConnected(out ConnectionInfo info) => connects.Take(out info);
+        public bool TryGetConnection(Guid id, out ConnectionInfo info)
+        {
+            lock (gate)
+            {
+                if (links.TryGetValue(id, out var c))
+                {
+                    info = new ConnectionInfo(c);
+                    return true;
+                }
+                info = default;
+                return false;
+            }
+        }
+        public Task<StartResult> StartAsync(CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Exchange(ref attempted, 1) != 0 || Volatile.Read(ref stoppingFlag) != 0)
+                throw new InvalidOperationException("Instances are single-use.");
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                listener = new TcpListener(BindAddress, TcpPort);
+                if (BindAddress.Equals(IPAddress.IPv6Any))
+                    listener.Server.DualMode = true;
+                listener.Start();
+                udp = new UdpClient(BindAddress.AddressFamily);
+                if (BindAddress.Equals(IPAddress.IPv6Any))
+                    udp.Client.DualMode = true;
+                udp.Client.Bind(new IPEndPoint(BindAddress, UdpPort));
+                accepting = AcceptLoop();
+                receiving = UdpLoop();
+                heartbeat = HeartbeatLoop();
+                return Task.FromResult(new StartResult(null));
+            }
+            catch (Exception ex) { Dispose(); return Task.FromResult(new StartResult(new VibeNetFailure(null, FailureCode.Socket, ex.Message))); }
+        }
+        public Task<SendResult> SendAsync(Guid connectionId, byte[] data, VibeNetTransport transport, CancellationToken cancellationToken = default)
+        {
+            Validate(data, transport);
+            cancellationToken.ThrowIfCancellationRequested();
+            Link? c;
+            lock (gate)
+                links.TryGetValue(connectionId, out c);
+            return c == null ? Task.FromResult(SendResult.NotConnected) : c.Send(data, transport, cancellationToken);
+        }
+        public Task<BroadcastResult> BroadcastAsync(byte[] data, VibeNetTransport transport, CancellationToken cancellationToken = default)
+        {
+            Validate(data, transport);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Interlocked.Increment(ref broadcasts) > 4)
+            {
+                Interlocked.Decrement(ref broadcasts);
+                return Task.FromResult(new BroadcastResult(new[] { 0, 0, ConnectedClientCount, 0 }));
+            }
+            return BroadcastCore(data, transport, cancellationToken);
+        }
+        private async Task<BroadcastResult> BroadcastCore(byte[] data, VibeNetTransport transport, CancellationToken cancellationToken)
+        {
+            try
+            {
+                Validate(data, transport);
+                cancellationToken.ThrowIfCancellationRequested();
+                var targets = Snapshot();
+                int[] counts = new int[4];
+                for (int offset = 0; offset < targets.Length; offset += 32)
+                {
+                    int n = Math.Min(32, targets.Length - offset);
+                    var tasks = new List<Task<SendResult>>(n);
+                    try
+                    {
+                        for (int j = 0; j < n; j++)
+                            tasks.Add(targets[offset + j].Send(data, transport, cancellationToken));
+                    }
+                    catch { try { await Task.WhenAll(tasks).ConfigureAwait(false); } catch { } throw; }
+                    var results = await Task.WhenAll(tasks).ConfigureAwait(false);
+                    foreach (var r in results)
+                        counts[(int)r]++;
+                }
+                return new BroadcastResult(counts);
+            }
+            finally { Interlocked.Decrement(ref broadcasts); }
+        }
+        public async Task<bool> DisconnectClientAsync(Guid id, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Link? c;
+            lock (gate)
+                links.TryGetValue(id, out c);
+            if (c == null)
+                return false;
+            await Wire.Wait(c.Disconnect(DisconnectReason.LocalRequested), cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        public Task StopAsync(CancellationToken cancellationToken = default)
+        {
+            Task task;
+            lock (gate)
+            {
+                if (stopping == null)
+                    stopping = Task.Run(StopCore);
+                task = stopping;
+            }
+            return Wire.Wait(task, cancellationToken);
+        }
+        private async Task StopCore()
+        {
+            Interlocked.Exchange(ref stoppingFlag, 1);
+            listener?.Stop();
+            var snapshot = Snapshot();
+            // Bounded fan-out, then force-close sockets; all owned operations are joined below.
+            long deadline = Clock.Now + Clock.Ticks(Configuration.SendTimeout);
+            for (int i = 0; i < snapshot.Length && Clock.Now < deadline; i += 32)
+            {
+                var pending = new List<Task>();
+                for (int j = i; j < Math.Min(i + 32, snapshot.Length); j++)
+                    pending.Add(snapshot[j].Disconnect(DisconnectReason.ServerStopped));
+                await Task.WhenAll(pending).ConfigureAwait(false);
+            }
+            foreach (var c in snapshot)
+                c.Close(DisconnectReason.ServerStopped);
+            Lifetime.Cancel();
+            udp?.Close();
+            try
+            {
+                await Task.WhenAll(accepting, receiving, heartbeat).ConfigureAwait(false);
+            }
+            catch { }
+            Task[] work;
+            lock (gate)
+            {
+                work = new Task[workers.Count];
+                workers.CopyTo(work);
+            }
+            try
+            {
+                await Task.WhenAll(work).ConfigureAwait(false);
+            }
+            catch { }
+            foreach (var c in snapshot)
+            {
+                c.Close(DisconnectReason.ServerStopped);
+                await c.Completion.Task.ConfigureAwait(false);
+            }
+        }
+        public override void Dispose()
+        {
+            Interlocked.Exchange(ref stoppingFlag, 1);
+            Lifetime.Cancel();
+            listener?.Stop();
+            udp?.Close();
+            foreach (var c in Snapshot())
+                c.Close(DisconnectReason.ServerStopped);
+        }
+        internal override async Task<int> SendDatagram(byte[] packet, IPEndPoint endpoint)
+        {
+            await DatagramGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                return await (udp ?? throw new ObjectDisposedException(nameof(VibeNetServer))).SendAsync(packet, packet.Length, endpoint).ConfigureAwait(false);
+            }
+            finally { DatagramGate.Release(); }
+        }
+        internal override void Closed(Link c, DisconnectReason reason, bool wasConnected)
+        {
+            lock (gate)
+            {
+                links.Remove(c.Id);
+                connected.Remove(c.Id);
+                deadlines.Remove(c);
+            }
+            if (wasConnected)
+                Disconnects.Add(new DisconnectInfo(c.Id, reason));
+        }
+        private Link[] Snapshot()
+        {
+            lock (gate)
+            {
+                var a = new Link[links.Count];
+                links.Values.CopyTo(a, 0);
+                return a;
+            }
+        }
+        private bool Admit(IPAddress source)
+        {
+            if (!attempts.Take(1))
+                return false;
+            source = source.MapToIPv6();
+            // Called by the single accept loop. Capped table with age-ordered admission.
+            while (sourceOrder.Count != 0)
+            {
+                var first = sourceOrder.Peek();
+                if (!Clock.Elapsed(sources[first].Stamp, TimeSpan.FromMinutes(1)))
+                    break;
+                sourceOrder.Dequeue();
+                sources.Remove(first);
+            }
+            if (!sources.TryGetValue(source, out var rate))
+            {
+                if (sources.Count >= Configuration.MaxTrackedAddresses)
+                    return false;
+                rate = new AddressRate(Configuration.MaxAttemptsPerAddressPerSecond);
+                sources.Add(source, rate);
+                sourceOrder.Enqueue(source);
+            }
+            return rate.Rate.Take(1);
+        }
+        private async Task AcceptLoop()
+        {
+            try
+            {
+                while (Volatile.Read(ref stoppingFlag) == 0)
+                {
+                    TcpClient tcp = await listener!.AcceptTcpClientAsync().ConfigureAwait(false);
+                    Link? link = null;
+                    try
+                    {
+                        if (Admit(((IPEndPoint)tcp.Client.RemoteEndPoint!).Address))
+                        {
+                            lock (gate)
+                            {
+                                if (stoppingFlag == 0 && links.Count < Configuration.MaxClients && links.Count - connected.Count < Configuration.MaxPendingHandshakes)
+                                {
+                                    link = new Link(this, tcp, Guid.NewGuid(), true);
+                                    links.Add(link.Id, link);
+                                }
+                            }
+                        }
+                    }
+                    catch { tcp.Dispose(); throw; }
+                    if (link == null)
+                    {
+                        tcp.Dispose();
+                        continue;
+                    }
+                    var c = link;
+                    var task = Task.Run(() => Session(c));
+                    c.Work = task;
+                    lock (gate)
+                        workers.Add(task);
+                    _ = task.ContinueWith(t => { lock (gate) workers.Remove(t); _ = t.Exception; }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                }
+            }
+            catch (Exception ex) { if (Volatile.Read(ref stoppingFlag) == 0) { Report(null, FailureCode.Socket, ex.Message); Dispose(); } }
+        }
+        private async Task Session(Link c)
+        {
+            if (!c.Enter())
+                return;
+            try
+            {
+                using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(Lifetime.Token, c.Stop.Token))
+                {
+                    timeout.CancelAfter(Configuration.ConnectTimeout);
+                    await c.Handshake(timeout.Token).ConfigureAwait(false);
+                }
+                lock (gate)
+                {
+                    if (c.State == ConnectionState.Connected && links.ContainsKey(c.Id))
+                    {
+                        connected.Add(c.Id);
+                        c.NextHeartbeat = Clock.Now + (long)(Math.Abs(c.Id.GetHashCode() % 1000) / 1000.0 * Clock.Ticks(Configuration.HeartbeatInterval));
+                        deadlines.Add(c);
+                        connects.Add(new ConnectionInfo(c));
+                    }
+                }
+                await c.Run().ConfigureAwait(false);
+            }
+            catch (Exception ex) { if (c.State != ConnectionState.Closed) { Report(c.Id, ex is OperationCanceledException ? FailureCode.Timeout : FailureCode.Handshake, "Secure handshake failed: " + ex.Message); c.Close(ex is OperationCanceledException ? DisconnectReason.Timeout : DisconnectReason.ProtocolError); } }
+            finally { c.Close(DisconnectReason.ConnectionLost); c.Exit(); await c.Completion.Task.ConfigureAwait(false); }
+        }
+        private async Task UdpLoop()
+        {
+            byte[] buffer = new byte[65536];
+            EndPoint any = new IPEndPoint(BindAddress.AddressFamily == AddressFamily.InterNetwork ? IPAddress.Any : IPAddress.IPv6Any, 0);
+            try
+            {
+                while (!Lifetime.IsCancellationRequested)
+                {
+                    var p = await udp!.Client.ReceiveFromAsync(new ArraySegment<byte>(buffer), SocketFlags.None, any).ConfigureAwait(false);
+                    if (!InputRate.Take(p.ReceivedBytes) || p.ReceivedBytes < 64 || !Wire.HeaderValid(buffer, VibeNetTransport.UDP, Configuration.MaxUdpPayloadBytes) || p.ReceivedBytes != Wire.Size((int)Wire.U32(buffer, 36)))
+                    {
+                        Interlocked.Increment(ref Dropped);
+                        continue;
+                    }
+                    Link? c;
+                    lock (gate)
+                        links.TryGetValue(Wire.Id(buffer), out c);
+                    if (c != null)
+                    {
+                        var packet = new byte[p.ReceivedBytes];
+                        Buffer.BlockCopy(buffer, 0, packet, 0, packet.Length);
+                        await c.ReceiveUdp(packet, (IPEndPoint)p.RemoteEndPoint).ConfigureAwait(false);
+                    }
+                    else
+                        Interlocked.Increment(ref Dropped);
+                }
+            }
+            catch (Exception ex) { if (!Lifetime.IsCancellationRequested) { Report(null, FailureCode.Socket, "UDP loop failed: " + ex.Message); Dispose(); } }
+        }
+        private async Task HeartbeatLoop()
+        {
+            try
+            {
+                while (!Lifetime.IsCancellationRequested)
+                {
+                    await Task.Delay(10, Lifetime.Token).ConfigureAwait(false);
+                    List<Link>? due = null;
+                    lock (gate)
+                    {
+                        Link? c;
+                        while (Volatile.Read(ref heartbeatWork) < 128 && (c = deadlines.Due(Clock.Now)) != null)
+                        {
+                            deadlines.Remove(c);
+                            c.NextHeartbeat = Clock.Now + Clock.Ticks(Configuration.HeartbeatInterval);
+                            deadlines.Add(c);
+                            Interlocked.Increment(ref heartbeatWork);
+                            if (due == null)
+                                due = new List<Link>();
+                            due.Add(c);
+                        }
+                    }
+                    if (due != null)
+                    foreach (var c in due)
+                        _ = HeartbeatOne(c);
+                }
+            }
+            catch (OperationCanceledException) { }
+        }
+        private async Task HeartbeatOne(Link c)
+        {
+            try
+            {
+                await c.Heartbeat().ConfigureAwait(false);
+            }
+            finally { Interlocked.Decrement(ref heartbeatWork); }
+        }
+    }
+    public sealed class VibeNetClient : VibeNetNode
+    {
+        public string Host
+        {
+            get;
+        }
+        public int TcpPort
+        {
+            get;
+        }
+        public int UdpPort
+        {
+            get;
+        }
+        public ConnectionState State => link?.State ?? (Volatile.Read(ref disposed) != 0 ? ConnectionState.Closed : Volatile.Read(ref attempted) == 0 ? ConnectionState.Created : ConnectionState.Connecting);
+        public Guid ConnectionId => link?.Id ?? Guid.Empty;
+        public ConnectionInfo? Connection => link == null ? (ConnectionInfo?)null : new ConnectionInfo(link);
+        private Link? link; private UdpClient? udp; private TcpClient? connecting;
+        private Task receiving = Task.CompletedTask, heartbeat = Task.CompletedTask; private int attempted, disposed;
+        internal override long EventLoss => Interlocked.Read(ref Disconnects.Lost) + Interlocked.Read(ref Failures.Lost);
+        public VibeNetClient(string host, int tcpPort = 7777, int? udpPort = null, VibeNetConfiguration? configuration = null) : base(configuration)
+        {
+            if (string.IsNullOrWhiteSpace(host))
+                throw new ArgumentException("Host required.", nameof(host));
+            Port(tcpPort);
+            Port(udpPort ?? tcpPort);
+            Host = host;
+            TcpPort = tcpPort;
+            UdpPort = udpPort ?? tcpPort;
+        }
+        public async Task<StartResult> StartAsync(CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Exchange(ref attempted, 1) != 0 || Volatile.Read(ref disposed) != 0)
+                throw new InvalidOperationException("Instances are single-use.");
+            using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, Lifetime.Token))
+            {
+                timeout.CancelAfter(Configuration.ConnectTimeout);
+                Link? c = null;
+                try
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var lookup = Dns.GetHostAddressesAsync(Host);
+                    await Wire.Wait(lookup, timeout.Token).ConfigureAwait(false);
+                    Exception? error = null;
+                    foreach (var address in await lookup.ConfigureAwait(false))
+                    {
+                        if (address.AddressFamily != AddressFamily.InterNetwork && address.AddressFamily != AddressFamily.InterNetworkV6)
+                            continue;
+                        TcpClient tcp = new TcpClient(address.AddressFamily);
+                        connecting = tcp;
+                        try
+                        {
+                            var connect = tcp.ConnectAsync(address, TcpPort);
+                            try
+                            {
+                                await Wire.Wait(connect, timeout.Token).ConfigureAwait(false);
+                            }
+                            catch { tcp.Close(); try { await connect.ConfigureAwait(false); } catch { } throw; }
+                            c = new Link(this, tcp, Guid.Empty, false);
+                            break;
+                        }
+                        catch (SocketException ex) { error = ex; tcp.Dispose(); }
+                    }
+                    if (c == null)
+                        throw error ?? new IOException("No usable address.");
+                    link = c;
+                    if (!c.Enter())
+                        throw new OperationCanceledException();
+                    try
+                    {
+                        udp = new UdpClient(c.TcpEndpoint.AddressFamily);
+                        udp.Connect(c.TcpEndpoint.Address, UdpPort);
+                        c.UdpEndpoint = new IPEndPoint(c.TcpEndpoint.Address, UdpPort);
+                        receiving = UdpLoop();
+                        await c.Handshake(timeout.Token).ConfigureAwait(false);
+                        c.Work = c.Run();
+                        heartbeat = HeartbeatLoop();
+                        return new StartResult(null);
+                    }
+                    finally { c.Exit(); }
+                }
+                catch (Exception ex) { Dispose(); if (cancellationToken.IsCancellationRequested) throw new OperationCanceledException(cancellationToken); return new StartResult(new VibeNetFailure(c?.Id, ex is OperationCanceledException ? FailureCode.Timeout : ex is PlatformNotSupportedException || ex is NotImplementedException ? FailureCode.UnsupportedRuntime : FailureCode.Handshake, ex.Message)); }
+            }
+        }
+        public Task<SendResult> SendAsync(byte[] data, VibeNetTransport transport, CancellationToken cancellationToken = default)
+        {
+            Validate(data, transport);
+            cancellationToken.ThrowIfCancellationRequested();
+            return link == null ? Task.FromResult(SendResult.NotConnected) : link.Send(data, transport, cancellationToken);
+        }
+        public async Task DisconnectAsync(CancellationToken cancellationToken = default)
+        {
+            var c = link;
+            if (c != null)
+                await Wire.Wait(c.Disconnect(DisconnectReason.LocalRequested), cancellationToken).ConfigureAwait(false);
+            Dispose();
+            await Wire.Wait(Task.WhenAll(receiving, heartbeat, c?.Work ?? Task.CompletedTask, c?.Completion.Task ?? Task.CompletedTask), cancellationToken).ConfigureAwait(false);
+        }
+        public override void Dispose()
+        {
+            Interlocked.Exchange(ref disposed, 1);
+            Lifetime.Cancel();
+            connecting?.Close();
+            udp?.Close();
+            link?.Close(DisconnectReason.LocalRequested);
+        }
+        internal override async Task<int> SendDatagram(byte[] packet, IPEndPoint endpoint)
+        {
+            await DatagramGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                return await (udp ?? throw new ObjectDisposedException(nameof(VibeNetClient))).SendAsync(packet, packet.Length).ConfigureAwait(false);
+            }
+            finally { DatagramGate.Release(); }
+        }
+        internal override void Closed(Link c, DisconnectReason reason, bool wasConnected)
+        {
+            Lifetime.Cancel();
+            udp?.Close();
+            if (wasConnected)
+                Disconnects.Add(new DisconnectInfo(c.Id, reason));
+        }
+        private async Task UdpLoop()
+        {
+            byte[] buffer = new byte[65536];
+            EndPoint any = new IPEndPoint(link!.TcpEndpoint.AddressFamily == AddressFamily.InterNetwork ? IPAddress.Any : IPAddress.IPv6Any, 0);
+            try
+            {
+                while (!Lifetime.IsCancellationRequested)
+                {
+                    var p = await udp!.Client.ReceiveFromAsync(new ArraySegment<byte>(buffer), SocketFlags.None, any).ConfigureAwait(false);
+                    if (InputRate.Take(p.ReceivedBytes) && p.ReceivedBytes >= 64 && Wire.HeaderValid(buffer, VibeNetTransport.UDP, Configuration.MaxUdpPayloadBytes) && p.ReceivedBytes == Wire.Size((int)Wire.U32(buffer, 36)))
+                    {
+                        var packet = new byte[p.ReceivedBytes];
+                        Buffer.BlockCopy(buffer, 0, packet, 0, packet.Length);
+                        await link.ReceiveUdp(packet, (IPEndPoint)p.RemoteEndPoint).ConfigureAwait(false);
+                    }
+                    else
+                        Interlocked.Increment(ref Dropped);
+                }
+            }
+            catch (Exception ex) { if (!Lifetime.IsCancellationRequested) link?.Fail(ex); }
+        }
+        private async Task HeartbeatLoop()
+        {
+            try
+            {
+                while (!Lifetime.IsCancellationRequested)
+                {
+                    await Task.Delay(Configuration.HeartbeatInterval, Lifetime.Token).ConfigureAwait(false);
+                    await link!.Heartbeat().ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) { }
+        }
+    }
 }
 
-internal static class VibeNetCancellation
-{
-    public static CancellationTokenSource CreateTimeoutSource(TimeSpan timeout)
-    {
-        CancellationTokenSource source = new CancellationTokenSource();
-        source.CancelAfter(timeout);
-        return source;
-    }
 
-    public static CancellationTokenSource CreateLinkedTimeoutSource(TimeSpan timeout, CancellationToken outer)
-    {
-        CancellationTokenSource source = CancellationTokenSource.CreateLinkedTokenSource(outer);
-        source.CancelAfter(timeout);
-        return source;
-    }
-}
-}

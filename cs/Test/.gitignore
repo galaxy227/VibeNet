@@ -1,0 +1,5 @@
+bin/
+obj/
+Artifacts/*.exe
+Artifacts/*.dll
+Artifacts/*.pdb
