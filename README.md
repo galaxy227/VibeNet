@@ -1,4 +1,4 @@
-# VibeNet 1 Library Guide
+# VibeNet Library Guide
 
 VibeNet is a single-file, dependency-free C# transport with encrypted TCP and UDP, server-assigned connection IDs, and plaintext byte-array polling. Copy `VibeNet.cs` into the application. The source targets C# 8 and .NET Standard 2.1 APIs. Protocol framing and cryptography remain internal.
 
