@@ -2,7 +2,11 @@
 
 VibeNet is a single-file, dependency-free C# transport with encrypted TCP and UDP, server-assigned connection IDs, and plaintext byte-array polling. Copy `VibeNet.cs` into the application. The source targets C# 8 and .NET Standard 2.1 APIs. Protocol framing and cryptography remain internal.
 
-## 1. Straightforward Example Program
+- [Example Program](#1-example-program)
+- [Public API Reference](#2-public-api-reference)
+- [Architecture Review](#3-architecture-review)
+
+## 1. Example Program
 
 This complete console example starts an echo server and one client. Both TCP and UDP ports must be reachable, even if the application only sends TCP messages. The default uses port 7777 for each protocol.
 
@@ -172,7 +176,7 @@ Poll messages, failures, and lifecycle notifications from the application's norm
 
 **Security boundary:** encryption is automatic, but peer identity is not authenticated. An attacker intercepting the initial exchange can impersonate either endpoint and read or modify the entire resulting session. There are deliberately no certificates, fingerprints, shared passwords, TLS, or DTLS configuration options. Application login alone over this connection does not remove that limitation.
 
-## 2. Complete Public API Reference
+## 2. Public API Reference
 
 All types are in namespace `VibeNet`. All properties below are get-only. Public data structs have no explicit public constructor; obtain them from library operations. Default struct values are placeholders, not successful operation results. Nullable properties are marked `?`.
 
@@ -350,7 +354,7 @@ switch (result)
 
 Failure, message, and lifecycle queues are independent. There is no single ordering spanning all queues, and polling a failure does not itself remove a disconnect notification. Check startup results immediately, send results when awaiting each send, and background observations during the normal processing loop.
 
-## 3. Technical Architecture Review
+## 3. Architecture Review
 
 This section establishes the project's engineering intent as well as its current implementation. Preserve behavioral guarantees when changing internals; distinguish intentional scope boundaries from implementation choices that can improve. The API reference describes what callers can rely on, while the wire specification describes what another endpoint must implement exactly.
 
@@ -543,5 +547,3 @@ Performance improvements must preserve bounded resource ownership and observable
 ### 3.15 Supporting development material
 
 `Test/` contains the standalone functional/internal-invariant harness, load and interoperability utilities, and runtime qualification helpers. Its `README.md` and `Artifacts/` hold execution instructions, coverage, measured results, and outstanding qualification work. Keep extensive test and environment-specific documentation there; it is development support, not part of the single-file distribution or public API.
-
-
